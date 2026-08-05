@@ -41,6 +41,11 @@
  * acceptance criterion.
  */
 
+/* asprintf and the srand48/lrand48 family are GNU/SVID extensions: newer
+ * glibc exposes them by default, the course nodes' older glibc only with
+ * _GNU_SOURCE. Must precede every system header. */
+#define _GNU_SOURCE
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
