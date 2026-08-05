@@ -35,13 +35,16 @@
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
  *
- * Stage 2 (T2): the connectivity layer end-to-end. Device init; the two
+ * Stage 3 (T3): the control protocol end-to-end. Device init; the two
  * 1 MB buffer registrations (the server's with remote-write permission);
  * QP create → init → RTR → RTS with the port's active MTU; the handshake
  * over TCP exchanging LID/QPN/PSN/GID plus the server's buffer addr/rkey;
- * both control receive pools posted at init. Both processes then exit 0
- * with nothing printed. The data path (RDMA WRITEs, the done/ack control
- * messages, timing) lands in later stages.
+ * both control receive pools posted at init; then the 21 done/ack SEND
+ * round trips on the data QP — one per size of the sweep, each an 8-byte
+ * inline control message carrying a sequence counter, which also proves
+ * the 32-deep control receive pool covers a full sweep. Both processes
+ * then exit 0 with nothing printed. The data path (RDMA WRITEs, timing)
+ * lands in later stages.
  *
  * Adapted from the assignment's bw_template.c: the socket exchange is the
  * template's, extended with the server's buffer address and rkey; the QP
@@ -82,6 +85,29 @@
 #define CTRL_POOL_DEPTH 32
 #define CTRL_MSG_LEN 64
 
+/* The number of control exchanges per direction: one done/ack pair per
+ * size of the sweep (2^0..2^20), which also proves the 32-deep control
+ * receive pool covers a full sweep. */
+#define SWEEP_SIZES 21
+
+/* Control messages: 8 bytes each — a fixed tag plus the sequence counter
+ * (the size index 0..20). The ack carries the received done verbatim, so
+ * a tag or sequence mismatch means the exchange desynchronized. */
+#define BW_CTRL_TAG 0x4354524cu
+struct bw_ctrl_msg {
+    uint32_t tag;
+    uint32_t seq;
+};
+
+/* The control message must always fit one inline send. */
+typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
+
+/* A control wait (the done on the server, the ack on the client, the
+ * ack-send on the server) has a deadline: the peer may have died, and a
+ * hung busy poll would tie up a course node until the verify script's
+ * own timeout fires. */
+#define CTRL_POLL_TIMEOUT_SEC 10
+
 /* The SQ depth is the window (W) plus slack: the slack absorbs the warmup
  * WRs riding ahead of the window plus the per-size control SENDs. Sized for
  * the warmup counts of the ex1 counts table; re-verified when the table
@@ -110,8 +136,19 @@
 #define DEST_FMT_PARSE   "%x:%x:%x:%32[0-9a-fA-F]:%" SCNx64 ":%x"
 
 enum {
-    /* A control receive (the done on the server, the ack on the client). */
+    /* Control receive: the done on the server, the ack on the client. All
+     * 32 receives of the control receive pool share one wr_id — they all
+     * point at the same control area, so which receive completed never
+     * matters. */
     BW_RECV_WRID = 1,
+    /* The client's done SEND, always signaled. */
+    BW_SEND_DONE_WRID,
+    /* The server's ack SEND, always signaled so the server consumes its
+     * completion before exiting. */
+    BW_SEND_ACK_WRID,
+    /* Data WRITEs (T4); one shared wr_id keeps their completions
+     * distinguishable from the control messages. */
+    BW_DATA_WRID,
 };
 
 static int page_size;
@@ -637,6 +674,166 @@ static int bw_post_control_recvs(struct bw_context *ctx)
     return i == CTRL_POOL_DEPTH ? 0 : 1;
 }
 
+/* Post one control SEND — the client's done or the server's ack — always
+ * signaled so the sender consumes a completion. The message rides inline when
+ * the QP's max_inline_data allows it (it always does in practice); the
+ * fallback stages it in the registered control area. */
+static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
+                             const struct bw_ctrl_msg *msg)
+{
+    struct ibv_sge sge = {
+            .addr	= (uintptr_t) msg,
+            .length = sizeof *msg,
+            .lkey	= 0
+    };
+    struct ibv_send_wr wr = {
+            .wr_id	    = wrid,
+            .opcode	    = IBV_WR_SEND,
+            .send_flags = IBV_SEND_SIGNALED,
+            .sg_list    = &sge,
+            .num_sge    = 1,
+            .next	    = NULL
+    };
+    struct ibv_send_wr *bad_wr;
+
+    if (ctx->max_inline_data >= (uint32_t) sizeof *msg) {
+        wr.send_flags |= IBV_SEND_INLINE;
+    } else {
+        /* Non-inline: the SEND is DMA-read from a registered buffer, so
+         * the message is staged in the control area. */
+        memcpy(ctx->ctrl_buf, msg, sizeof *msg);
+        sge.addr = (uint64_t) ctx->ctrl_buf;
+        sge.lkey = ctx->ctrl_mr->lkey;
+    }
+
+    if (ibv_post_send(ctx->qp, &wr, &bad_wr)) {
+        fprintf(stderr, "Couldn't post control SEND\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* Poll the shared CQ until a completion with wr_id `want` arrives.
+ * Completions whose wr_id bit is set in `pass` are consumed and ignored —
+ * the client passes its done-send completions through while waiting for
+ * the ack receive. Nothing else may complete, so a bad status or an
+ * unexpected wr_id is a protocol error, as is a wait past the deadline. */
+static int bw_poll_until(struct bw_context *ctx, uint64_t want,
+                         uint64_t pass, struct ibv_wc *wc)
+{
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += CTRL_POLL_TIMEOUT_SEC;
+
+    for (;;) {
+        struct timespec now;
+        int ne = ibv_poll_cq(ctx->cq, 1, wc);
+
+        if (ne < 0) {
+            fprintf(stderr, "poll CQ failed %d\n", ne);
+            return 1;
+        }
+        if (ne == 1) {
+            if (wc->status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "Bad status %s (%d) for wr_id %llu\n",
+                        ibv_wc_status_str(wc->status), wc->status,
+                        (unsigned long long) wc->wr_id);
+                return 1;
+            }
+            if (wc->wr_id == want)
+                return 0;
+            if (!(pass & (1ull << wc->wr_id))) {
+                fprintf(stderr, "Unexpected completion for wr_id %llu\n",
+                        (unsigned long long) wc->wr_id);
+                return 1;
+            }
+            continue;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec &&
+             now.tv_nsec >= deadline.tv_nsec)) {
+            fprintf(stderr,
+                    "Timed out after %d s waiting for wr_id %llu\n",
+                    CTRL_POLL_TIMEOUT_SEC, (unsigned long long) want);
+            return 1;
+        }
+    }
+}
+
+/* Wait for the next control message on the pre-posted control receive
+ * pool and verify it: the fixed tag and the expected sequence counter.
+ * `pass` is handed to bw_poll_until — the client passes its done-send
+ * completions through while waiting for the ack. */
+static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
+                        uint32_t seq, const char *kind)
+{
+    struct ibv_wc wc;
+    struct bw_ctrl_msg msg;
+
+    if (bw_poll_until(ctx, BW_RECV_WRID, pass, &wc))
+        return 1;
+
+    msg = *(const struct bw_ctrl_msg *) ctx->ctrl_buf;
+    if (msg.tag != BW_CTRL_TAG || msg.seq != seq) {
+        fprintf(stderr, "%s mismatch: tag 0x%x seq %u, expected seq %u\n",
+                kind, msg.tag, msg.seq, seq);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Client side of the control protocol: one signaled done SEND per size of
+ * the sweep; the ack receive for each must carry the done's sequence
+ * counter back. The control receive pool is never refreshed — the 21 acks
+ * consume 21 of the 32 pre-posted receives. */
+static int bw_client_ctrl_exchange(struct bw_context *ctx)
+{
+    uint32_t seq;
+
+    for (seq = 0; seq < SWEEP_SIZES; ++seq) {
+        struct bw_ctrl_msg msg = { .tag = BW_CTRL_TAG, .seq = seq };
+
+        if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &msg))
+            return 1;
+
+        /* Poll for the ack; the done's own send completion rides the same
+         * CQ and is consumed as it goes. */
+        if (bw_recv_ctrl(ctx, 1ull << BW_SEND_DONE_WRID, seq, "Ack"))
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Server side: poll each done off the pre-posted control receive pool —
+ * nothing is ever reposted — verify its sequence counter, and ack it back.
+ * The ack's own send completion is consumed before the next done is
+ * awaited: it is the guarantee the ack left the HCA. */
+static int bw_server_ctrl_exchange(struct bw_context *ctx)
+{
+    uint32_t seq;
+
+    for (seq = 0; seq < SWEEP_SIZES; ++seq) {
+        struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
+        struct ibv_wc wc;
+
+        if (bw_recv_ctrl(ctx, 0, seq, "Done"))
+            return 1;
+
+        if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
+            return 1;
+
+        if (bw_poll_until(ctx, BW_SEND_ACK_WRID, 0, &wc))
+            return 1;
+    }
+
+    return 0;
+}
+
 static int bw_close_ctx(struct bw_context *ctx)
 {
     if (ibv_destroy_qp(ctx->qp)) {
@@ -849,8 +1046,18 @@ int main(int argc, char *argv[])
                           rem_dest, gidx))
             return 1;
 
-    /* Connectivity established: both QPs in RTS. T2 exits cleanly here; the
-     * data path lands in later stages. */
+    /* The control protocol: 21 done/ack exchanges on the data QP — the
+     * client drives one done per size of the sweep, the server acks each.
+     * Both sides verify every sequence counter. */
+    if (servername) {
+        if (bw_client_ctrl_exchange(ctx))
+            return 1;
+    } else {
+        if (bw_server_ctrl_exchange(ctx))
+            return 1;
+    }
+
+    /* All 21 exchanges complete; nothing printed. */
     {
         int rc = bw_close_ctx(ctx);
 

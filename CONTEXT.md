@@ -32,6 +32,10 @@ _Avoid_: batch size, poll period
 The send-loop discipline of reclaiming only the CQEs that are ready and reposting immediately, so the SQ never empties and the NIC never idles.
 _Avoid_: drain, wait-for-all
 
+**Poll loop**:
+The completion-reaping loop shared by both roles: poll one CQE at a time, route it by wr_id (the data / done / ack taxonomy), and stop at the completion being waited for.
+_Avoid_: reap, spin
+
 **Control message**:
 One of the two SENDs exchanged per size on the data QP: the done and the ack. The only messages in the run besides data WRITEs.
 _Avoid_: handshake, ping, signal
@@ -43,6 +47,10 @@ _Avoid_: finish, notify
 **Ack**:
 The server's control message back; its receive completion on the client stops the clock. Sent with `IBV_WR_SEND` per the assignment.
 _Avoid_: reply, response, confirmation
+
+**Sequence counter**:
+The size index 0–20 carried by both control messages; the ack echoes the done's, so a mismatch means the exchange desynchronized.
+_Avoid_: seqno, serial number
 
 **Completion barrier**:
 The property that ack arrival implies all of the size's WRITEs are written in server memory — guaranteed by RC in-order delivery of the done SEND that precedes it.

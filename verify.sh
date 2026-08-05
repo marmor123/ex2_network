@@ -11,16 +11,16 @@
 # PASS/FAIL report is printed — paste it back into the dev session.
 # This script is a dev workflow tool; it is NOT part of the submission archive.
 #
-# Stage 2 (current): connectivity.
-#   [2.1] make builds server + client (symlink) with zero warnings
+# Stage 3 (current): control protocol.
+#   [3.1] make builds server + client (symlink) with zero warnings
 #         (-O3 -Wall -Wextra, from a clean tree)
-#   [2.2] server executable, client symlink to server
-#   [2.3] client role only: ./client 127.0.0.1 with no server listening
+#   [3.2] server executable, client symlink to server
+#   [3.3] client role only: ./client 127.0.0.1 with no server listening
 #         exits non-zero, prints nothing (stdout and stderr), no hang
-#   [2.4] both roles: run the two scripts simultaneously on the pair — the
-#         server accepts one client, the extended address exchange
-#         (LID/QPN/PSN/GID + server buffer addr/rkey) completes, both QPs
-#         reach RTS, and both processes exit 0 with nothing printed
+#   [3.4] both roles: run the two scripts simultaneously on the pair — the
+#         client sends a signaled done SEND per size of the sweep (21), the
+#         server acks each one back; the full 21-exchange sequence completes
+#         and both processes exit 0 with nothing printed
 
 set -u
 
@@ -31,7 +31,7 @@ if [ $# -ge 1 ]; then
     peer="$1"
 fi
 
-stage=2
+stage=3
 pass=0
 fail=0
 
@@ -52,7 +52,7 @@ report() { # report <check> <PASS|FAIL> [detail ...]
 echo "=== Lab #2 verify: stage $stage ($role side) ==="
 [ "$role" = client ] && echo "    peer: $peer"
 
-# --- [2.1] Build gate (both roles) ------------------------------------------
+# --- [3.1] Build gate (both roles) ------------------------------------------
 
 build_warns=$(make clean >/dev/null 2>&1; make 2>&1 >/dev/null)
 if [ $? -eq 0 ] && [ -z "$build_warns" ]; then
@@ -68,7 +68,7 @@ else
     report "server executable, client symlink to server" FAIL
 fi
 
-# --- [2.3] Graceful failure when no server listens (client role only) -------
+# --- [3.3] Graceful failure when no server listens (client role only) -------
 
 if [ "$role" = client ]; then
     out=$(timeout 10 ./client 127.0.0.1 2>&1)
@@ -84,33 +84,35 @@ if [ "$role" = client ]; then
     fi
 fi
 
-# --- [2.4] Connectivity: handshake completes, clean exit (both roles) -------
+# --- [3.4] Control protocol: 21 done/ack exchanges, clean exit (both roles) --
 #
-# Run the two scripts at the same time on the pair: the server side blocks
-# in accept() until the client side connects.
+# Run the two scripts at the same time on the pair: after the handshake the
+# client sends a signaled done SEND per size of the sweep (21 total) and
+# waits for each ack; the server acks every done. Both processes exit 0
+# with nothing printed.
 
 if [ "$role" = server ]; then
     out=$(timeout 60 ./server 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
-        report "server: handshake completes, exit 0, nothing printed" PASS
+        report "server: 21 done/ack exchanges, exit 0, nothing printed" PASS
     elif [ "$rc" -eq 124 ]; then
-        report "server: handshake completes, exit 0, nothing printed" FAIL \
+        report "server: 21 done/ack exchanges, exit 0, nothing printed" FAIL \
                "timed out waiting for the client — is the other node's script running?"
     else
-        report "server: handshake completes, exit 0, nothing printed" FAIL \
+        report "server: 21 done/ack exchanges, exit 0, nothing printed" FAIL \
                "exit code $rc, output: '$(echo "$out" | head -3)'"
     fi
 else
     out=$(timeout 60 ./client "$peer" 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
-        report "client: handshake completes, exit 0, nothing printed" PASS
+        report "client: 21 done/ack exchanges, exit 0, nothing printed" PASS
     elif [ "$rc" -eq 124 ]; then
-        report "client: handshake completes, exit 0, nothing printed" FAIL \
+        report "client: 21 done/ack exchanges, exit 0, nothing printed" FAIL \
                "timed out — is the server-side script running on $peer?"
     else
-        report "client: handshake completes, exit 0, nothing printed" FAIL \
+        report "client: 21 done/ack exchanges, exit 0, nothing printed" FAIL \
                "exit code $rc, output: '$(echo "$out" | head -3)'"
     fi
 fi
