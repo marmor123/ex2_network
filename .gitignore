@@ -1,0 +1,10 @@
+# C build artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+
+# Claude Code local config (machine-specific; do not share)
+.claude/settings.local.json
