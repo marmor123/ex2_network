@@ -35,10 +35,18 @@
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
  *
- * Stage 1 (T1): build skeleton & compile gate. Adapted from the assignment's
- * bw_template.c with the template's debug prints removed; the client exits
- * non-zero and silently when no server is listening, per the stage-1
- * acceptance criterion.
+ * Stage 2 (T2): the connectivity layer end-to-end. Device init; the two
+ * 1 MB buffer registrations (the server's with remote-write permission);
+ * QP create → init → RTR → RTS with the port's active MTU; the handshake
+ * over TCP exchanging LID/QPN/PSN/GID plus the server's buffer addr/rkey;
+ * both control receive pools posted at init. Both processes then exit 0
+ * with nothing printed. The data path (RDMA WRITEs, the done/ack control
+ * messages, timing) lands in later stages.
+ *
+ * Adapted from the assignment's bw_template.c: the socket exchange is the
+ * template's, extended with the server's buffer address and rkey; the QP
+ * lifecycle (INIT/RTR/RTS, rnr_retry/retry_cnt, access flags) is the
+ * template's.
  */
 
 /* asprintf and the srand48/lrand48 family are GNU/SVID extensions: newer
@@ -59,67 +67,76 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
+#include <inttypes.h>
 
 #include <infiniband/verbs.h>
 
-#define WC_BATCH (10)
+/* One 1 MB buffer per side, registered once and never modified after init,
+ * so there is no buffer-reuse hazard at full window depth (ADR-0002). */
+#define BUFFER_SIZE (1u << 20)
+
+/* Control receive pool (ADR-0001): 32 receives per side, posted once at
+ * init, all pointing at one control area, never refreshed. Covers the 21
+ * per-direction control messages of a full sweep. */
+#define CTRL_POOL_DEPTH 32
+#define CTRL_MSG_LEN 64
+
+/* The SQ depth is the window (W) plus slack: the slack absorbs the warmup
+ * WRs riding ahead of the window plus the per-size control SENDs. Sized for
+ * the warmup counts of the ex1 counts table; re-verified when the table
+ * lands with the data path. */
+#define QP_SLACK 1024
+
+#define WINDOW_DEFAULT 256
+
+/* The max_inline_data declared at QP creation. mlx4 — the course hardware —
+ * rejects QP creation if the declared value exceeds the 1024 bytes its
+ * WQEs can carry, so the declaration must never exceed that. The value the
+ * QP was actually created with is read back via ibv_query_qp; that
+ * read-back is the runtime max_inline_data the data path uses
+ * (ibv_query_device no longer exposes it on modern rdma-core). */
+#define MAX_INLINE_DATA_DECLARE 1024
+
+/* Fixed-size handshake message, both directions. The client's message
+ * carries only the first four fields (addr/rkey are the server's to give). */
+#define DEST_MSG_LEN 128
+
+/* The handshake's wire format, kept in one place so the send and parse
+ * sides cannot drift: lid:qpn:psn:gid, plus :addr:rkey on the server. */
+#define DEST_FMT         "%04x:%06x:%06x:%s"
+#define DEST_FMT_SERVER  DEST_FMT ":%" PRIx64 ":%x"
+#define DEST_FMT_PARSE   "%x:%x:%x:%32[0-9a-fA-F]:%" SCNx64 ":%x"
 
 enum {
-    PINGPONG_RECV_WRID = 1,
-    PINGPONG_SEND_WRID = 2,
+    /* A control receive (the done on the server, the ack on the client). */
+    BW_RECV_WRID = 1,
 };
 
 static int page_size;
 
-
-struct pingpong_context {
+struct bw_context {
     struct ibv_context		*context;
-    struct ibv_comp_channel	*channel;
     struct ibv_pd		*pd;
-    struct ibv_mr		*mr;
+    struct ibv_mr		*mr;      /* the 1 MB buffer */
+    struct ibv_mr		*ctrl_mr; /* the control receive area */
     struct ibv_cq		*cq;
     struct ibv_qp		*qp;
-    void			*buf;
-    int				size;
-    int				rx_depth;
-    int				routs;
-    struct ibv_port_attr	portinfo;
+    void			*buf;     /* the 1 MB buffer */
+    void			*ctrl_buf;/* the control receive area */
+    uint32_t		 max_inline_data; /* the QP's negotiated max_inline_data */
+    struct ibv_port_attr	 portinfo;
 };
 
-struct pingpong_dest {
+struct bw_dest {
     int lid;
     int qpn;
     int psn;
     union ibv_gid gid;
+    /* Server side only: buffer address and rkey for the client's RDMA
+     * WRITEs. Zero on the client (the server never touches client memory). */
+    uint64_t buf_addr;
+    uint32_t rkey;
 };
-
-enum ibv_mtu pp_mtu_to_enum(int mtu)
-{
-    switch (mtu) {
-    case 256:  return IBV_MTU_256;
-    case 512:  return IBV_MTU_512;
-    case 1024: return IBV_MTU_1024;
-    case 2048: return IBV_MTU_2048;
-    case 4096: return IBV_MTU_4096;
-    default:   return -1;
-    }
-}
-
-uint16_t pp_get_local_lid(struct ibv_context *context, int port)
-{
-    struct ibv_port_attr attr;
-
-    if (ibv_query_port(context, port, &attr))
-        return 0;
-
-    return attr.lid;
-}
-
-int pp_get_port_info(struct ibv_context *context, int port,
-                     struct ibv_port_attr *attr)
-{
-    return ibv_query_port(context, port, attr);
-}
 
 void wire_gid_to_gid(const char *wgid, union ibv_gid *gid)
 {
@@ -142,9 +159,62 @@ void gid_to_wire_gid(const union ibv_gid *gid, char wgid[])
         sprintf(&wgid[i * 8], "%08x", htonl(*(uint32_t *)(gid->raw + i * 4)));
 }
 
-static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
-                          enum ibv_mtu mtu, int sl,
-                          struct pingpong_dest *dest, int sgid_idx)
+/* Loop until len bytes move or the stream ends: the handshake messages are
+ * fixed-size, and a short read would break the parse. */
+static int bw_read_full(int fd, void *buf, size_t len)
+{
+    size_t got = 0;
+
+    while (got < len) {
+        ssize_t n = read(fd, (char *) buf + got, len - got);
+        if (n <= 0)
+            return 0;
+        got += n;
+    }
+    return 1;
+}
+
+static int bw_write_full(int fd, const void *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = write(fd, (const char *) buf + sent, len - sent);
+        if (n <= 0)
+            return 0;
+        sent += n;
+    }
+    return 1;
+}
+
+static struct bw_dest *bw_parse_dest(const char *msg, int expect_addr)
+{
+    struct bw_dest *dest = calloc(1, sizeof *dest);
+    char gid[33];
+    int n;
+
+    if (!dest)
+        return NULL;
+
+    /* The server's message carries all six fields; the client's carries the
+     * first four (addr/rkey stay zero). The client expects the server's
+     * addr/rkey — its RDMA WRITEs land there — so it requires all six; a
+     * truncated server message must not pass with addr/rkey zero. */
+    n = sscanf(msg, DEST_FMT_PARSE,
+               &dest->lid, &dest->qpn, &dest->psn, gid,
+               &dest->buf_addr, &dest->rkey);
+    if (n < 4 || (expect_addr && n < 6)) {
+        free(dest);
+        return NULL;
+    }
+
+    wire_gid_to_gid(gid, &dest->gid);
+    return dest;
+}
+
+static int bw_connect_qp(struct bw_context *ctx, int port, int my_psn,
+                         enum ibv_mtu mtu,
+                         struct bw_dest *dest, int sgid_idx)
 {
     struct ibv_qp_attr attr = {
             .qp_state		= IBV_QPS_RTR,
@@ -156,13 +226,17 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
             .ah_attr		= {
                     .is_global	= 0,
                     .dlid		= dest->lid,
-                    .sl		= sl,
+                    .sl		= 0,
                     .src_path_bits	= 0,
                     .port_num	= port
             }
     };
 
-    if (dest->gid.global.interface_id) {
+    /* GRH addressing is used iff the remote advertised a nonzero GID and we
+     * have a GID index of our own; a remote GID with no local index (-g on
+     * one side only) therefore degrades to LID-based addressing — the course
+     * fabric's normal mode — instead of failing RTR on sgid_index = -1. */
+    if (dest->gid.global.interface_id && sgid_idx >= 0) {
         attr.ah_attr.is_global = 1;
         attr.ah_attr.grh.hop_limit = 1;
         attr.ah_attr.grh.dgid = dest->gid;
@@ -200,8 +274,8 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
     return 0;
 }
 
-static struct pingpong_dest *pp_client_exch_dest(const char *servername, int port,
-                                                 const struct pingpong_dest *my_dest)
+static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
+                                           const struct bw_dest *my_dest)
 {
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -209,10 +283,10 @@ static struct pingpong_dest *pp_client_exch_dest(const char *servername, int por
             .ai_socktype = SOCK_STREAM
     };
     char *service;
-    char msg[sizeof "0000:000000:000000:00000000000000000000000000000000"];
+    char msg[DEST_MSG_LEN];
     int n;
     int sockfd = -1;
-    struct pingpong_dest *rem_dest = NULL;
+    struct bw_dest *rem_dest = NULL;
     char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
@@ -240,46 +314,48 @@ static struct pingpong_dest *pp_client_exch_dest(const char *servername, int por
     free(service);
 
     if (sockfd < 0) {
-        /* T1: connecting to a non-listening server must fail silently —
-           exit non-zero with nothing printed (acceptance criterion). */
+        /* No server listening: fail silently — exit non-zero with nothing
+           printed (T1 acceptance criterion). */
         return NULL;
     }
 
     gid_to_wire_gid(&my_dest->gid, gid);
-    sprintf(msg, "%04x:%06x:%06x:%s", my_dest->lid, my_dest->qpn, my_dest->psn, gid);
-    if (write(sockfd, msg, sizeof msg) != sizeof msg) {
+    memset(msg, 0, sizeof msg);
+    sprintf(msg, DEST_FMT, my_dest->lid, my_dest->qpn, my_dest->psn, gid);
+    if (!bw_write_full(sockfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
         goto out;
     }
 
-    if (read(sockfd, msg, sizeof msg) != sizeof msg) {
+    if (!bw_read_full(sockfd, msg, sizeof msg)) {
         perror("client read");
         fprintf(stderr, "Couldn't read remote address\n");
         goto out;
     }
 
-    if (write(sockfd, "done", sizeof "done") != sizeof "done") {
+    /* The server keeps the socket open until we signal receipt, so this
+     * must go out before we close. */
+    if (!bw_write_full(sockfd, "ready", sizeof "ready")) {
         perror("client write");
         goto out;
     }
 
-    rem_dest = malloc(sizeof *rem_dest);
-    if (!rem_dest)
+    rem_dest = bw_parse_dest(msg, 1);
+    if (!rem_dest) {
+        fprintf(stderr, "Couldn't parse remote address\n");
         goto out;
+    }
 
-    sscanf(msg, "%x:%x:%x:%s", &rem_dest->lid, &rem_dest->qpn, &rem_dest->psn, gid);
-    wire_gid_to_gid(gid, &rem_dest->gid);
-
-    out:
+out:
     close(sockfd);
     return rem_dest;
 }
 
-static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
-                                                 int ib_port, enum ibv_mtu mtu,
-                                                 int port, int sl,
-                                                 const struct pingpong_dest *my_dest,
-                                                 int sgid_idx)
+static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
+                                           int ib_port, enum ibv_mtu mtu,
+                                           int port,
+                                           const struct bw_dest *my_dest,
+                                           int sgid_idx)
 {
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -288,10 +364,10 @@ static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
             .ai_socktype = SOCK_STREAM
     };
     char *service;
-    char msg[sizeof "0000:000000:000000:00000000000000000000000000000000"];
+    char msg[DEST_MSG_LEN];
     int n;
     int sockfd = -1, connfd;
-    struct pingpong_dest *rem_dest = NULL;
+    struct bw_dest *rem_dest = NULL;
     char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
@@ -335,70 +411,80 @@ static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
         return NULL;
     }
 
-    n = read(connfd, msg, sizeof msg);
-    if (n != sizeof msg) {
+    if (!bw_read_full(connfd, msg, sizeof msg)) {
         perror("server read");
-        fprintf(stderr, "%d/%d: Couldn't read remote address\n", n, (int) sizeof msg);
+        fprintf(stderr, "Couldn't read remote address\n");
         goto out;
     }
 
-    rem_dest = malloc(sizeof *rem_dest);
-    if (!rem_dest)
+    rem_dest = bw_parse_dest(msg, 0);
+    if (!rem_dest) {
+        fprintf(stderr, "Couldn't parse remote address\n");
         goto out;
+    }
 
-    sscanf(msg, "%x:%x:%x:%s", &rem_dest->lid, &rem_dest->qpn, &rem_dest->psn, gid);
-    wire_gid_to_gid(gid, &rem_dest->gid);
-
-    if (pp_connect_ctx(ctx, ib_port, my_dest->psn, mtu, sl, rem_dest, sgid_idx)) {
+    if (bw_connect_qp(ctx, ib_port, my_dest->psn, mtu, rem_dest, sgid_idx)) {
         fprintf(stderr, "Couldn't connect to remote QP\n");
         free(rem_dest);
         rem_dest = NULL;
         goto out;
     }
 
-
+    /* Send our address plus the buffer addr/rkey the client needs for its
+     * RDMA WRITEs. */
     gid_to_wire_gid(&my_dest->gid, gid);
-    sprintf(msg, "%04x:%06x:%06x:%s", my_dest->lid, my_dest->qpn, my_dest->psn, gid);
-    if (write(connfd, msg, sizeof msg) != sizeof msg) {
+    memset(msg, 0, sizeof msg);
+    sprintf(msg, DEST_FMT_SERVER,
+            my_dest->lid, my_dest->qpn, my_dest->psn, gid,
+            my_dest->buf_addr, my_dest->rkey);
+    if (!bw_write_full(connfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
         free(rem_dest);
         rem_dest = NULL;
         goto out;
     }
 
-    if (read(connfd, msg, sizeof msg) != sizeof msg) {
-        perror("server read");
-        free(rem_dest);
-        rem_dest = NULL;
-        goto out;
+    /* Final beat: the client signals it has our address with "ready" and
+     * closes. The template leaves this read unchecked; the message is
+     * short, so check the count, not the message size. */
+    {
+        char ready[sizeof "ready"];
+
+        if (!bw_read_full(connfd, ready, sizeof ready)) {
+            perror("server read");
+            free(rem_dest);
+            rem_dest = NULL;
+            goto out;
+        }
     }
 
-    out:
+out:
     close(connfd);
     return rem_dest;
 }
 
-static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
-                                            int rx_depth, int tx_depth, int port,
-                                            int use_event, int is_server)
+static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
+                                      int window, int is_server)
 {
-    struct pingpong_context *ctx;
+    struct bw_context *ctx;
 
     ctx = calloc(1, sizeof *ctx);
     if (!ctx)
         return NULL;
 
-    ctx->size     = size;
-    ctx->rx_depth = rx_depth;
-    ctx->routs    = rx_depth;
-
-    ctx->buf = malloc(roundup(size, page_size));
+    ctx->buf = malloc(roundup(BUFFER_SIZE, page_size));
     if (!ctx->buf) {
         fprintf(stderr, "Couldn't allocate work buf.\n");
         return NULL;
     }
 
-    memset(ctx->buf, 0x7b + is_server, size);
+    memset(ctx->buf, 0x7b + is_server, BUFFER_SIZE);
+
+    ctx->ctrl_buf = malloc(CTRL_MSG_LEN);
+    if (!ctx->ctrl_buf) {
+        fprintf(stderr, "Couldn't allocate control buf.\n");
+        return NULL;
+    }
 
     ctx->context = ibv_open_device(ib_dev);
     if (!ctx->context) {
@@ -407,29 +493,31 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
         return NULL;
     }
 
-    if (use_event) {
-        ctx->channel = ibv_create_comp_channel(ctx->context);
-        if (!ctx->channel) {
-            fprintf(stderr, "Couldn't create completion channel\n");
-            return NULL;
-        }
-    } else
-        ctx->channel = NULL;
-
     ctx->pd = ibv_alloc_pd(ctx->context);
     if (!ctx->pd) {
         fprintf(stderr, "Couldn't allocate PD\n");
         return NULL;
     }
 
-    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
+    /* The server's buffer must accept remote writes (the client's RDMA
+     * WRITEs land here); the client's is only read by its own HCA. */
+    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, BUFFER_SIZE,
+                         IBV_ACCESS_LOCAL_WRITE |
+                         (is_server ? IBV_ACCESS_REMOTE_WRITE : 0));
     if (!ctx->mr) {
         fprintf(stderr, "Couldn't register MR\n");
         return NULL;
     }
 
-    ctx->cq = ibv_create_cq(ctx->context, rx_depth + tx_depth, NULL,
-            ctx->channel, 0);
+    ctx->ctrl_mr = ibv_reg_mr(ctx->pd, ctx->ctrl_buf, CTRL_MSG_LEN,
+                              IBV_ACCESS_LOCAL_WRITE);
+    if (!ctx->ctrl_mr) {
+        fprintf(stderr, "Couldn't register control MR\n");
+        return NULL;
+    }
+
+    ctx->cq = ibv_create_cq(ctx->context, window + QP_SLACK + CTRL_POOL_DEPTH,
+                            NULL, NULL, 0);
     if (!ctx->cq) {
         fprintf(stderr, "Couldn't create CQ\n");
         return NULL;
@@ -440,10 +528,13 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
                 .send_cq = ctx->cq,
                 .recv_cq = ctx->cq,
                 .cap     = {
-                        .max_send_wr  = tx_depth,
-                        .max_recv_wr  = rx_depth,
+                        .max_send_wr  = window + QP_SLACK,
+                        .max_recv_wr  = CTRL_POOL_DEPTH,
                         .max_send_sge = 1,
-                        .max_recv_sge = 1
+                        .max_recv_sge = 1,
+                        /* Declared at QP creation: mlx4 rejects the QP if
+                         * the request exceeds the hardware's max_inline_data. */
+                        .max_inline_data = MAX_INLINE_DATA_DECLARE
                 },
                 .qp_type = IBV_QPT_RC
         };
@@ -453,6 +544,19 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
             fprintf(stderr, "Couldn't create QP\n");
             return NULL;
         }
+    }
+
+    {
+        /* The runtime max_inline_data: read back what the QP was created
+         * with, since the driver may clamp the request. */
+        struct ibv_qp_attr attr;
+        struct ibv_qp_init_attr init_attr;
+
+        if (ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr)) {
+            fprintf(stderr, "Couldn't query QP attributes\n");
+            return NULL;
+        }
+        ctx->max_inline_data = init_attr.cap.max_inline_data;
     }
 
     {
@@ -477,7 +581,33 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
     return ctx;
 }
 
-int pp_close_ctx(struct pingpong_context *ctx)
+/* Post the entire control receive pool — never refreshed: each control
+ * message consumes one pre-posted receive, and 32 cover a full sweep
+ * (ADR-0001, assignment item 3). Returns 0 when all are posted. */
+static int bw_post_control_recvs(struct bw_context *ctx)
+{
+    struct ibv_sge list = {
+            .addr	= (uint64_t) ctx->ctrl_buf,
+            .length = CTRL_MSG_LEN,
+            .lkey	= ctx->ctrl_mr->lkey
+    };
+    struct ibv_recv_wr wr = {
+            .wr_id	    = BW_RECV_WRID,
+            .sg_list    = &list,
+            .num_sge    = 1,
+            .next       = NULL
+    };
+    struct ibv_recv_wr *bad_wr;
+    int i;
+
+    for (i = 0; i < CTRL_POOL_DEPTH; ++i)
+        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+            break;
+
+    return i == CTRL_POOL_DEPTH ? 0 : 1;
+}
+
+static int bw_close_ctx(struct bw_context *ctx)
 {
     if (ibv_destroy_qp(ctx->qp)) {
         fprintf(stderr, "Couldn't destroy QP\n");
@@ -486,6 +616,11 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
     if (ibv_destroy_cq(ctx->cq)) {
         fprintf(stderr, "Couldn't destroy CQ\n");
+        return 1;
+    }
+
+    if (ibv_dereg_mr(ctx->ctrl_mr)) {
+        fprintf(stderr, "Couldn't deregister control MR\n");
         return 1;
     }
 
@@ -499,117 +634,15 @@ int pp_close_ctx(struct pingpong_context *ctx)
         return 1;
     }
 
-    if (ctx->channel) {
-        if (ibv_destroy_comp_channel(ctx->channel)) {
-            fprintf(stderr, "Couldn't destroy completion channel\n");
-            return 1;
-        }
-    }
-
     if (ibv_close_device(ctx->context)) {
         fprintf(stderr, "Couldn't release context\n");
         return 1;
     }
 
+    free(ctx->ctrl_buf);
     free(ctx->buf);
     free(ctx);
 
-    return 0;
-}
-
-static int pp_post_recv(struct pingpong_context *ctx, int n)
-{
-    struct ibv_sge list = {
-            .addr	= (uintptr_t) ctx->buf,
-            .length = ctx->size,
-            .lkey	= ctx->mr->lkey
-    };
-    struct ibv_recv_wr wr = {
-            .wr_id	    = PINGPONG_RECV_WRID,
-            .sg_list    = &list,
-            .num_sge    = 1,
-            .next       = NULL
-    };
-    struct ibv_recv_wr *bad_wr;
-    int i;
-
-    for (i = 0; i < n; ++i)
-        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
-            break;
-
-    return i;
-}
-
-static int pp_post_send(struct pingpong_context *ctx)
-{
-    struct ibv_sge list = {
-            .addr	= (uint64_t)ctx->buf,
-            .length = ctx->size,
-            .lkey	= ctx->mr->lkey
-    };
-
-    struct ibv_send_wr *bad_wr, wr = {
-            .wr_id	    = PINGPONG_SEND_WRID,
-            .sg_list    = &list,
-            .num_sge    = 1,
-            .opcode     = IBV_WR_SEND,
-            .send_flags = IBV_SEND_SIGNALED,
-            .next       = NULL
-    };
-
-    return ibv_post_send(ctx->qp, &wr, &bad_wr);
-}
-
-int pp_wait_completions(struct pingpong_context *ctx, int iters)
-{
-    int rcnt = 0, scnt = 0;
-    while (rcnt + scnt < iters) {
-        struct ibv_wc wc[WC_BATCH];
-        int ne, i;
-
-        do {
-            ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
-            if (ne < 0) {
-                fprintf(stderr, "poll CQ failed %d\n", ne);
-                return 1;
-            }
-
-        } while (ne < 1);
-
-        for (i = 0; i < ne; ++i) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                        ibv_wc_status_str(wc[i].status),
-                        wc[i].status, (int) wc[i].wr_id);
-                return 1;
-            }
-
-            switch ((int) wc[i].wr_id) {
-            case PINGPONG_SEND_WRID:
-                ++scnt;
-                break;
-
-            case PINGPONG_RECV_WRID:
-                if (--ctx->routs <= 10) {
-                    ctx->routs += pp_post_recv(ctx, ctx->rx_depth - ctx->routs);
-                    if (ctx->routs < ctx->rx_depth) {
-                        fprintf(stderr,
-                                "Couldn't post receive (%d)\n",
-                                ctx->routs);
-                        return 1;
-                    }
-                }
-                ++rcnt;
-                break;
-
-            default:
-                fprintf(stderr, "Completion for unknown wr_id %d\n",
-                        (int) wc[i].wr_id);
-                return 1;
-            }
-        }
-
-    }
     return 0;
 }
 
@@ -620,36 +653,26 @@ static void usage(const char *argv0)
     printf("  %s <host>     connect to server at <host>\n", argv0);
     printf("\n");
     printf("Options:\n");
-    printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
+    printf("  -p, --port=<port>      handshake port (default 18515)\n");
     printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
     printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-    printf("  -s, --size=<size>      size of message to exchange (default 4096)\n");
-    printf("  -m, --mtu=<size>       path MTU (default 1024)\n");
-    printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
-    printf("  -n, --iters=<iters>    number of exchanges (default 1000)\n");
-    printf("  -l, --sl=<sl>          service level value\n");
-    printf("  -e, --events           sleep on CQ events (default poll)\n");
-    printf("  -g, --gid-idx=<gid index> local port gid index\n");
+    printf("  -r, --window=<depth>   window depth W: max outstanding data WRs (default %d)\n",
+           WINDOW_DEFAULT);
+    printf("  -g, --gid-idx=<index>  local port gid index (default: LID-based)\n");
 }
 
 int main(int argc, char *argv[])
 {
     struct ibv_device      **dev_list;
     struct ibv_device       *ib_dev;
-    struct pingpong_context *ctx;
-    struct pingpong_dest     my_dest;
-    struct pingpong_dest    *rem_dest;
+    struct bw_context       *ctx;
+    struct bw_dest          my_dest;
+    struct bw_dest         *rem_dest;
     char                    *ib_devname = NULL;
     char                    *servername = NULL;
     int                      port = 18515; /* matches usage() */
     int                      ib_port = 1;
-    enum ibv_mtu             mtu = IBV_MTU_2048;
-    int                      rx_depth = 100;
-    int                      tx_depth = 100;
-    int                      iters = 1000;
-    int                      use_event = 0;
-    int                      size = 1;
-    int                      sl = 0;
+    int                      window = WINDOW_DEFAULT;
     int                      gidx = -1;
 
     srand48(getpid() * time(NULL));
@@ -661,17 +684,12 @@ int main(int argc, char *argv[])
                 { .name = "port",     .has_arg = 1, .val = 'p' },
                 { .name = "ib-dev",   .has_arg = 1, .val = 'd' },
                 { .name = "ib-port",  .has_arg = 1, .val = 'i' },
-                { .name = "size",     .has_arg = 1, .val = 's' },
-                { .name = "mtu",      .has_arg = 1, .val = 'm' },
-                { .name = "rx-depth", .has_arg = 1, .val = 'r' },
-                { .name = "iters",    .has_arg = 1, .val = 'n' },
-                { .name = "sl",       .has_arg = 1, .val = 'l' },
-                { .name = "events",   .has_arg = 0, .val = 'e' },
+                { .name = "window",   .has_arg = 1, .val = 'r' },
                 { .name = "gid-idx",  .has_arg = 1, .val = 'g' },
                 { 0 }
         };
 
-        c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:", long_options, NULL);
+        c = getopt_long(argc, argv, "p:d:i:r:g:", long_options, NULL);
         if (c == -1)
             break;
 
@@ -696,32 +714,12 @@ int main(int argc, char *argv[])
             }
             break;
 
-        case 's':
-            size = strtol(optarg, NULL, 0);
-            break;
-
-        case 'm':
-            mtu = pp_mtu_to_enum(strtol(optarg, NULL, 0));
-            if (mtu < 0) {
+        case 'r':
+            window = strtol(optarg, NULL, 0);
+            if (window <= 0) {
                 usage(argv[0]);
                 return 1;
             }
-            break;
-
-        case 'r':
-            rx_depth = strtol(optarg, NULL, 0);
-            break;
-
-        case 'n':
-            iters = strtol(optarg, NULL, 0);
-            break;
-
-        case 'l':
-            sl = strtol(optarg, NULL, 0);
-            break;
-
-        case 'e':
-            ++use_event;
             break;
 
         case 'g':
@@ -767,24 +765,18 @@ int main(int argc, char *argv[])
         }
     }
 
-    ctx = pp_init_ctx(ib_dev, size, rx_depth, tx_depth, ib_port, use_event, !servername);
+    ctx = bw_init_ctx(ib_dev, ib_port, window, !servername);
     if (!ctx)
         return 1;
 
-    ctx->routs = pp_post_recv(ctx, ctx->rx_depth);
-    if (ctx->routs < ctx->rx_depth) {
-        fprintf(stderr, "Couldn't post receive (%d)\n", ctx->routs);
+    /* The whole control receive pool is posted before the handshake, so no
+     * control message can ever find the RQ empty (ADR-0001). */
+    if (bw_post_control_recvs(ctx)) {
+        fprintf(stderr, "Couldn't post control receives\n");
         return 1;
     }
 
-    if (use_event)
-        if (ibv_req_notify_cq(ctx->cq, 0)) {
-            fprintf(stderr, "Couldn't request CQ notification\n");
-            return 1;
-        }
-
-
-    if (pp_get_port_info(ctx->context, ib_port, &ctx->portinfo)) {
+    if (ibv_query_port(ctx->context, ib_port, &ctx->portinfo)) {
         fprintf(stderr, "Couldn't get port info\n");
         return 1;
     }
@@ -806,38 +798,34 @@ int main(int argc, char *argv[])
     my_dest.qpn = ctx->qp->qp_num;
     my_dest.psn = lrand48() & 0xffffff;
 
+    /* The path MTU comes from the port's active MTU, so large messages use
+     * the largest packets the link allows. */
     if (servername)
-        rem_dest = pp_client_exch_dest(servername, port, &my_dest);
-    else
-        rem_dest = pp_server_exch_dest(ctx, ib_port, mtu, port, sl, &my_dest, gidx);
+        rem_dest = bw_exch_dest_client(servername, port, &my_dest);
+    else {
+        /* The server advertises its buffer — the client's RDMA WRITEs land
+         * here — and nothing else beyond the template's QP address. */
+        my_dest.buf_addr = (uint64_t) ctx->buf;
+        my_dest.rkey = ctx->mr->rkey;
+        rem_dest = bw_exch_dest_server(ctx, ib_port, ctx->portinfo.active_mtu,
+                                       port, &my_dest, gidx);
+    }
 
     if (!rem_dest)
         return 1;
 
     if (servername)
-        if (pp_connect_ctx(ctx, ib_port, my_dest.psn, mtu, sl, rem_dest, gidx))
+        if (bw_connect_qp(ctx, ib_port, my_dest.psn, ctx->portinfo.active_mtu,
+                          rem_dest, gidx))
             return 1;
 
-    if (servername) {
-        int i;
-        for (i = 0; i < iters; i++) {
-            if ((i != 0) && (i % tx_depth == 0)) {
-                pp_wait_completions(ctx, tx_depth);
-            }
-            if (pp_post_send(ctx)) {
-                fprintf(stderr, "Client couldn't post send\n");
-                return 1;
-            }
-        }
-    } else {
-        if (pp_post_send(ctx)) {
-            fprintf(stderr, "Server couldn't post send\n");
-            return 1;
-        }
-        pp_wait_completions(ctx, iters);
+    /* Connectivity established: both QPs in RTS. T2 exits cleanly here; the
+     * data path lands in later stages. */
+    {
+        int rc = bw_close_ctx(ctx);
+
+        free(rem_dest);
+        ibv_free_device_list(dev_list);
+        return rc;
     }
-
-    ibv_free_device_list(dev_list);
-    free(rem_dest);
-    return 0;
 }
