@@ -55,6 +55,7 @@
 #define _GNU_SOURCE
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -89,12 +90,13 @@
 
 #define WINDOW_DEFAULT 256
 
-/* The max_inline_data declared at QP creation. mlx4 — the course hardware —
- * rejects QP creation if the declared value exceeds the 1024 bytes its
- * WQEs can carry, so the declaration must never exceed that. The value the
- * QP was actually created with is read back via ibv_query_qp; that
- * read-back is the runtime max_inline_data the data path uses
- * (ibv_query_device no longer exposes it on modern rdma-core). */
+/* The largest max_inline_data tried at QP creation. mlx4 — the course
+ * hardware — rejects QP creation when the declared value exceeds what its
+ * WQEs can carry, and no portable query exposes that ceiling on every
+ * stack, so the declaration is stepped down (bw_init_ctx) until creation
+ * succeeds. The value the QP was actually created with is read back via
+ * ibv_query_qp; that read-back is the runtime max_inline_data the data
+ * path uses. */
 #define MAX_INLINE_DATA_DECLARE 1024
 
 /* Fixed-size handshake message, both directions. The client's message
@@ -467,6 +469,9 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
                                       int window, int is_server)
 {
     struct bw_context *ctx;
+    struct ibv_device_attr dev_attr;
+    uint32_t max_send_wr;
+    uint32_t max_recv_wr;
 
     ctx = calloc(1, sizeof *ctx);
     if (!ctx)
@@ -493,6 +498,19 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         return NULL;
     }
 
+    /* The advertised per-QP WR limits: mlx4 caps the WQEs a QP may hold,
+     * and a declaration above the device's max_qp_wr fails QP creation. */
+    if (ibv_query_device(ctx->context, &dev_attr)) {
+        fprintf(stderr, "Couldn't query device attributes\n");
+        return NULL;
+    }
+    max_send_wr = window + QP_SLACK;
+    max_recv_wr = CTRL_POOL_DEPTH;
+    if (max_send_wr > (uint32_t) dev_attr.max_qp_wr)
+        max_send_wr = dev_attr.max_qp_wr;
+    if (max_recv_wr > (uint32_t) dev_attr.max_qp_wr)
+        max_recv_wr = dev_attr.max_qp_wr;
+
     ctx->pd = ibv_alloc_pd(ctx->context);
     if (!ctx->pd) {
         fprintf(stderr, "Couldn't allocate PD\n");
@@ -516,7 +534,7 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         return NULL;
     }
 
-    ctx->cq = ibv_create_cq(ctx->context, window + QP_SLACK + CTRL_POOL_DEPTH,
+    ctx->cq = ibv_create_cq(ctx->context, max_send_wr + max_recv_wr,
                             NULL, NULL, 0);
     if (!ctx->cq) {
         fprintf(stderr, "Couldn't create CQ\n");
@@ -524,24 +542,36 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
     }
 
     {
-        struct ibv_qp_init_attr attr = {
-                .send_cq = ctx->cq,
-                .recv_cq = ctx->cq,
-                .cap     = {
-                        .max_send_wr  = window + QP_SLACK,
-                        .max_recv_wr  = CTRL_POOL_DEPTH,
-                        .max_send_sge = 1,
-                        .max_recv_sge = 1,
-                        /* Declared at QP creation: mlx4 rejects the QP if
-                         * the request exceeds the hardware's max_inline_data. */
-                        .max_inline_data = MAX_INLINE_DATA_DECLARE
-                },
-                .qp_type = IBV_QPT_RC
-        };
+        int try_inline;
 
-        ctx->qp = ibv_create_qp(ctx->pd, &attr);
-        if (!ctx->qp)  {
-            fprintf(stderr, "Couldn't create QP\n");
+        /* The inline declaration is stepped down until QP creation
+         * succeeds: mlx4 rejects the QP when the declared max_inline_data
+         * (plus WQE overhead) exceeds what the hardware accepts, and no
+         * portable query exposes that ceiling on every stack. The value
+         * the QP was actually created with is read back below; that
+         * read-back is the runtime max_inline_data the data path uses. */
+        for (try_inline = MAX_INLINE_DATA_DECLARE;; try_inline -= 64) {
+            struct ibv_qp_init_attr attr = {
+                    .send_cq = ctx->cq,
+                    .recv_cq = ctx->cq,
+                    .cap     = {
+                            .max_send_wr  = max_send_wr,
+                            .max_recv_wr  = max_recv_wr,
+                            .max_send_sge = 1,
+                            .max_recv_sge = 1,
+                            .max_inline_data = try_inline
+                    },
+                    .qp_type = IBV_QPT_RC
+            };
+
+            ctx->qp = ibv_create_qp(ctx->pd, &attr);
+            if (ctx->qp || try_inline <= 0)
+                break;
+        }
+        if (!ctx->qp) {
+            fprintf(stderr,
+                    "Couldn't create QP (send_wr %u, recv_wr %u, inline %d): %s\n",
+                    max_send_wr, max_recv_wr, try_inline, strerror(errno));
             return NULL;
         }
     }
