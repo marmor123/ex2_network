@@ -136,6 +136,11 @@ else
     nlines=$(printf '%s\n' "$out" | wc -l)
     if [ "$nlines" -eq 21 ]; then
         report "client: exactly 21 result lines" PASS
+        # The evidence: the measured sweep itself, so a PASS can be judged
+        # against the raw numbers, not taken on faith.
+        printf '             --- sweep output (raw) ---\n'
+        printf '%s\n' "$out" | sed 's/^/             /'
+        printf '             ---\n'
     else
         report "client: exactly 21 result lines" FAIL \
                "got $nlines line(s), expected 21"
@@ -196,21 +201,24 @@ else
         first=$1; last=$2; max=$3
 
         if awk -v f="$first" -v l="$last" 'BEGIN { exit (l < f * 100) }'; then
-            report "client: 1 MB >= 100x 1 B (rate-bound -> wire-bound)" PASS
+            report "client: 1 MB >= 100x 1 B (rate-bound -> wire-bound)" PASS \
+                   "1 B: $first Gbps, 1 MB: $last Gbps"
         else
             report "client: 1 MB >= 100x 1 B (rate-bound -> wire-bound)" FAIL \
                    "1 B: $first Gbps, 1 MB: $last Gbps"
         fi
 
         if awk -v l="$last" 'BEGIN { exit (l < 10) }'; then
-            report "client: 1 MB is wire-bound (>= 10 Gbps)" PASS
+            report "client: 1 MB is wire-bound (>= 10 Gbps)" PASS \
+                   "1 MB: $last Gbps"
         else
             report "client: 1 MB is wire-bound (>= 10 Gbps)" FAIL \
                    "1 MB: $last Gbps"
         fi
 
         if awk -v m="$max" 'BEGIN { exit (m > 60) }'; then
-            report "client: never above the 56 Gb/s link rate" PASS
+            report "client: never above the 56 Gb/s link rate" PASS \
+                   "peak: $max Gbps"
         else
             report "client: never above the 56 Gb/s link rate" FAIL \
                    "peak $max Gbps exceeds the link rate"
