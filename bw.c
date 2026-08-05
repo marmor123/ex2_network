@@ -35,16 +35,26 @@
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
  *
- * Stage 3 (T3): the control protocol end-to-end. Device init; the two
- * 1 MB buffer registrations (the server's with remote-write permission);
- * QP create → init → RTR → RTS with the port's active MTU; the handshake
- * over TCP exchanging LID/QPN/PSN/GID plus the server's buffer addr/rkey;
- * both control receive pools posted at init; then the 21 done/ack SEND
- * round trips on the data QP — one per size of the sweep, each an 8-byte
- * inline control message carrying a sequence counter, which also proves
- * the 32-deep control receive pool covers a full sweep. Both processes
- * then exit 0 with nothing printed. The data path (RDMA WRITEs, timing)
- * lands in later stages.
+ * Stage 4 (T4): the full sweep with the naive WRITE data path. The client
+ * runs the 21-size sweep (1 B..1 MB, powers of two) with ex1's converged
+ * counts table: per size a warmup batch, then the timed batch of signaled
+ * RDMA WRITEs — one WR per ibv_post_send, completions polled only when the
+ * SQ is full (no window or signal-interval accounting yet; that is T5).
+ * The clock (CLOCK_MONOTONIC) starts at the first timed post and stops at
+ * the ack-receive completion (ADR-0003); each size prints an ex1-identical
+ * "size\t%.2f\tunit" line with auto-scaled bps→Gbps units. The server's
+ * only data-path role is absorbing the WRITEs into its registered buffer;
+ * it just acks each done.
+ *
+ * The control protocol (T3): per size one done SEND (client, signaled)
+ * and one ack SEND (server, 8-byte inline carrying the sequence counter),
+ * both riding the data QP (ADR-0001) over the 32-deep control receive
+ * pool posted at init, never refreshed.
+ *
+ * Device init and handshake: the two 1 MB buffer registrations (the
+ * server's with remote-write permission); QP create → init → RTR → RTS
+ * with the port's active MTU; the TCP exchange of LID/QPN/PSN/GID plus
+ * the server's buffer addr/rkey.
  *
  * Adapted from the assignment's bw_template.c: the socket exchange is the
  * template's, extended with the server's buffer address and rkey; the QP
@@ -90,6 +100,22 @@
  * receive pool covers a full sweep. */
 #define SWEEP_SIZES 21
 
+/* The ex1 converged counts table, verbatim: one entry per size of the
+ * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
+ * (throughput variance < 1% between doubled counts); WARMUP_COUNTS from
+ * ex1's warmup probe. */
+static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
+        1310720, 81920, 655360, 163840, 327680, /* 1B 2B 4B 8B 16B */
+        20480, 81920, 81920, 40960, 20480,      /* 32B 64B 128B 256B 512B */
+        20480, 20480, 20480, 2560, 2560,        /* 1KB 2KB 4KB 8KB 16KB */
+        2560, 640, 320, 160, 160,               /* 32KB 64KB 128KB 256KB 512KB */
+        80                                       /* 1MB */
+};
+
+static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
+        16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
+};
+
 /* Control messages: 8 bytes each — a fixed tag plus the sequence counter
  * (the size index 0..20). The ack carries the received done verbatim, so
  * a tag or sequence mismatch means the exchange desynchronized. */
@@ -109,9 +135,9 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
 #define CTRL_POLL_TIMEOUT_SEC 10
 
 /* The SQ depth is the window (W) plus slack: the slack absorbs the warmup
- * WRs riding ahead of the window plus the per-size control SENDs. Sized for
- * the warmup counts of the ex1 counts table; re-verified when the table
- * lands with the data path. */
+ * WRs riding ahead of the window plus the per-size control SENDs (T5's
+ * windowed path). The same depth bounds the naive pipeline of T4 — the
+ * most WRs the client can have outstanding at once. */
 #define QP_SLACK 1024
 
 #define WINDOW_DEFAULT 256
@@ -146,7 +172,7 @@ enum {
     /* The server's ack SEND, always signaled so the server consumes its
      * completion before exiting. */
     BW_SEND_ACK_WRID,
-    /* Data WRITEs (T4); one shared wr_id keeps their completions
+    /* Data WRITEs; one shared wr_id keeps their completions
      * distinguishable from the control messages. */
     BW_DATA_WRID,
 };
@@ -163,6 +189,7 @@ struct bw_context {
     void			*buf;     /* the 1 MB buffer */
     void			*ctrl_buf;/* the control receive area */
     uint32_t		 max_inline_data; /* the QP's negotiated max_inline_data */
+    uint32_t		 sq_depth;      /* the QP's negotiated max_send_wr */
     struct ibv_port_attr	 portinfo;
 };
 
@@ -624,6 +651,7 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
             return NULL;
         }
         ctx->max_inline_data = init_attr.cap.max_inline_data;
+        ctx->sq_depth = init_attr.cap.max_send_wr;
     }
 
     {
@@ -713,11 +741,31 @@ static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
     return 0;
 }
 
+/* Classify one completion: good status and a wr_id whose bit is set in
+ * `allowed`. Prints the error and returns 1 otherwise — the two poll
+ * loops share this so their protocol-error reports cannot drift. */
+static int bw_wc_bad(struct ibv_wc *wc, uint64_t allowed)
+{
+    if (wc->status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "Bad status %s (%d) for wr_id %llu\n",
+                ibv_wc_status_str(wc->status), wc->status,
+                (unsigned long long) wc->wr_id);
+        return 1;
+    }
+    if (!(allowed & (1ull << wc->wr_id))) {
+        fprintf(stderr, "Unexpected completion for wr_id %llu\n",
+                (unsigned long long) wc->wr_id);
+        return 1;
+    }
+    return 0;
+}
+
 /* Poll the shared CQ until a completion with wr_id `want` arrives.
  * Completions whose wr_id bit is set in `pass` are consumed and ignored —
- * the client passes its done-send completions through while waiting for
- * the ack receive. Nothing else may complete, so a bad status or an
- * unexpected wr_id is a protocol error, as is a wait past the deadline. */
+ * the client passes its done-send and data completions through while
+ * waiting for the ack receive. Nothing else may complete, so a bad status
+ * or an unexpected wr_id is a protocol error, as is a wait past the
+ * deadline. */
 static int bw_poll_until(struct bw_context *ctx, uint64_t want,
                          uint64_t pass, struct ibv_wc *wc)
 {
@@ -735,19 +783,10 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
             return 1;
         }
         if (ne == 1) {
-            if (wc->status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "Bad status %s (%d) for wr_id %llu\n",
-                        ibv_wc_status_str(wc->status), wc->status,
-                        (unsigned long long) wc->wr_id);
+            if (bw_wc_bad(wc, pass | (1ull << want)))
                 return 1;
-            }
             if (wc->wr_id == want)
                 return 0;
-            if (!(pass & (1ull << wc->wr_id))) {
-                fprintf(stderr, "Unexpected completion for wr_id %llu\n",
-                        (unsigned long long) wc->wr_id);
-                return 1;
-            }
             continue;
         }
 
@@ -766,15 +805,21 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
 /* Wait for the next control message on the pre-posted control receive
  * pool and verify it: the fixed tag and the expected sequence counter.
  * `pass` is handed to bw_poll_until — the client passes its done-send
- * completions through while waiting for the ack. */
+ * and data completions through while waiting for the ack. `t_stamp`, when
+ * non-NULL, receives CLOCK_MONOTONIC at the completion — the client's t1
+ * for this size. */
 static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
-                        uint32_t seq, const char *kind)
+                        uint32_t seq, const char *kind,
+                        struct timespec *t_stamp)
 {
     struct ibv_wc wc;
     struct bw_ctrl_msg msg;
 
     if (bw_poll_until(ctx, BW_RECV_WRID, pass, &wc))
         return 1;
+
+    if (t_stamp)
+        clock_gettime(CLOCK_MONOTONIC, t_stamp);
 
     msg = *(const struct bw_ctrl_msg *) ctx->ctrl_buf;
     if (msg.tag != BW_CTRL_TAG || msg.seq != seq) {
@@ -786,24 +831,130 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
     return 0;
 }
 
-/* Client side of the control protocol: one signaled done SEND per size of
- * the sweep; the ack receive for each must carry the done's sequence
- * counter back. The control receive pool is never refreshed — the 21 acks
- * consume 21 of the 32 pre-posted receives. */
-static int bw_client_ctrl_exchange(struct bw_context *ctx)
+/* Poll completions until the SQ has room for one more WR. The naive
+ * pipeline signals every WR, so any completion frees exactly one slot;
+ * a poll returning 0 only means the last WQEs are still in flight, so the
+ * poll is retried (briefly) instead of erroring. During the data path
+ * only data WRITE completions may be pending here, so anything else is a
+ * protocol error. */
+static int bw_ensure_sq_slot(struct bw_context *ctx, int *outstanding)
+{
+    while (*outstanding >= (int) ctx->sq_depth) {
+        struct ibv_wc wc;
+        int ne = ibv_poll_cq(ctx->cq, 1, &wc);
+
+        if (ne < 0) {
+            fprintf(stderr, "poll CQ failed %d\n", ne);
+            return 1;
+        }
+        if (ne == 0)
+            continue;
+
+        if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
+            return 1;
+        --*outstanding;
+    }
+    return 0;
+}
+
+/* Post `n` RDMA WRITEs of `size` bytes into the server's registered
+ * buffer, one WR per ibv_post_send, each signaled. The naive pipeline:
+ * no window or signal-interval accounting (that is T5) — the SQ itself is
+ * the pipe, kept full by bw_ensure_sq_slot. `outstanding` tracks WRs
+ * posted but not yet completed. */
+static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
+                          size_t size, uint64_t n, int *outstanding)
+{
+    while (n > 0) {
+        struct ibv_sge sge = {
+                .addr	= (uint64_t) ctx->buf,
+                .length = size,
+                .lkey	= ctx->mr->lkey
+        };
+        struct ibv_send_wr wr = {
+                .wr_id	    = BW_DATA_WRID,
+                .opcode	    = IBV_WR_RDMA_WRITE,
+                .send_flags = IBV_SEND_SIGNALED,
+                .sg_list    = &sge,
+                .num_sge    = 1,
+                .next	    = NULL
+        };
+        struct ibv_send_wr *bad_wr;
+
+        wr.wr.rdma.remote_addr = dest->buf_addr;
+        wr.wr.rdma.rkey = dest->rkey;
+
+        if (bw_ensure_sq_slot(ctx, outstanding))
+            return 1;
+        if (ibv_post_send(ctx->qp, &wr, &bad_wr)) {
+            fprintf(stderr, "Couldn't post data WRITE\n");
+            return 1;
+        }
+        ++*outstanding;
+        --n;
+    }
+    return 0;
+}
+
+/* Print one result line, byte-identical to ex1: the size, throughput in
+ * auto-scaled units (bps → Gbps), and nothing else. */
+static void bw_print_result(size_t size, uint64_t count, double elapsed)
+{
+    double bps = (double) size * (double) count * 8.0 / elapsed;
+
+    if (bps < 1000.0)
+        printf("%zu\t%.2f\t%s\n", size, bps, "bps");
+    else if (bps < 1000000.0)
+        printf("%zu\t%.2f\t%s\n", size, bps / 1000.0, "Kbps");
+    else if (bps < 1000000000.0)
+        printf("%zu\t%.2f\t%s\n", size, bps / 1000000.0, "Mbps");
+    else
+        printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
+}
+
+/* Client side of the full sweep: per size, the warmup batch of WRITEs,
+ * then the timed batch — the clock starts at the first timed post and
+ * stops at the ack-receive completion (ADR-0003) — closed by the done
+ * SEND. The ack wait passes the data and done-send completions through;
+ * the 21 acks consume 21 of the 32 pre-posted control receive pool, never
+ * refreshed. */
+static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     uint32_t seq;
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
-        struct bw_ctrl_msg msg = { .tag = BW_CTRL_TAG, .seq = seq };
+        size_t size = (size_t) 1 << seq;
+        struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
+        struct timespec t0, t1;
+        double elapsed;
+        /* Scoped to this size's posting: the ack wait consumes the
+         * remaining data and done completions without touching the
+         * counter, so it must not survive into the next size. */
+        int outstanding = 0;
 
-        if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &msg))
+        if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq], &outstanding))
             return 1;
 
-        /* Poll for the ack; the done's own send completion rides the same
-         * CQ and is consumed as it goes. */
-        if (bw_recv_ctrl(ctx, 1ull << BW_SEND_DONE_WRID, seq, "Ack"))
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        if (bw_post_writes(ctx, dest, size, MSG_COUNTS[seq], &outstanding))
             return 1;
+
+        /* The done SEND needs a free SQ slot too. */
+        if (bw_ensure_sq_slot(ctx, &outstanding))
+            return 1;
+        if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
+            return 1;
+        ++outstanding;
+
+        if (bw_recv_ctrl(ctx,
+                         (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),
+                         seq, "Ack", &t1))
+            return 1;
+
+        elapsed = (double) (t1.tv_sec - t0.tv_sec) +
+                  (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        bw_print_result(size, MSG_COUNTS[seq], elapsed);
     }
 
     return 0;
@@ -821,7 +972,7 @@ static int bw_server_ctrl_exchange(struct bw_context *ctx)
         struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
         struct ibv_wc wc;
 
-        if (bw_recv_ctrl(ctx, 0, seq, "Done"))
+        if (bw_recv_ctrl(ctx, 0, seq, "Done", NULL))
             return 1;
 
         if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
@@ -1046,18 +1197,18 @@ int main(int argc, char *argv[])
                           rem_dest, gidx))
             return 1;
 
-    /* The control protocol: 21 done/ack exchanges on the data QP — the
-     * client drives one done per size of the sweep, the server acks each.
-     * Both sides verify every sequence counter. */
+    /* The full sweep: the client streams the WRITEs of each size and
+     * drives one done SEND per size, the server acks each. Both sides
+     * verify every sequence counter. */
     if (servername) {
-        if (bw_client_ctrl_exchange(ctx))
+        if (bw_client_bench(ctx, rem_dest))
             return 1;
     } else {
         if (bw_server_ctrl_exchange(ctx))
             return 1;
     }
 
-    /* All 21 exchanges complete; nothing printed. */
+    /* All 21 sizes complete; the 21 result lines were printed. */
     {
         int rc = bw_close_ctx(ctx);
 
