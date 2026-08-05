@@ -5,6 +5,8 @@
 *.out
 *.a
 *.so
+server
+client
 
 # Claude Code local config (machine-specific; do not share)
 .claude/settings.local.json
