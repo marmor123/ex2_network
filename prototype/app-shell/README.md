@@ -29,13 +29,17 @@ or the arrow keys (`?variant=A|B|C` in the URL; reload-stable):
 | **D** | Studio | Split-screen, Claude-like (cream, white panels, terracotta). Left: code on top, explanation below. Right: a hand-drawn-style SVG diagram synced to the frame — struct design (linked lists, pointers), the connection, the live traffic — with leader-line annotations and a facts strip under every figure. One idea per frame; dotted progress + corner arrows at the bottom. | Step through the frames with the corner arrows; the diagram tracks the code |
 
 Content is shared: home (experiment, roles, envelope chart, spine) and the
-stops built so far — **The experiment** (ADR-0003 clock window), **The
-handshake** (ADR-0001 TCP exchange + control receive pool), **Memory region**
-(ADR-0002 registration + declare-then-read-back), and **Posting the window**
-(ADR-0002 window/refill) — each with concept / annotated code / ADR why /
-viva what-ifs, using CONTEXT.md vocabulary. Stops are added per the wayfinder
-build tickets (#14: setup chapters, #15: data path, #16: envelope/choices/
-audit).
+stops built so far — the **Setup** group (**The experiment**, ADR-0003 clock
+window; **The handshake**, ADR-0001 TCP exchange + control receive pool;
+**Memory region**, ADR-0002 registration + declare-then-read-back) and the
+full **Data path** group (**Posting the window**, **The doorbell**, **On the
+wire**, **Landing in server memory**, **Completions**) — each with concept /
+annotated code / ADR why / viva what-ifs, using CONTEXT.md vocabulary. The
+data-path chapters carry the research findings: the HCA's ~853 MB/s inline
+copy (research #12, wire stop), the 2 KB per-message DMA floor (research #13,
+wire stop), the completion-slaved ~163 ns ceiling (research #11, completions
+stop). Stops are added per the wayfinder build tickets (#14: setup chapters,
+#15: data path, #16: envelope/choices/audit).
 
 The envelope chart follows the dataviz skill (single-series line on log2
 sizes, crosshair + tooltip, table twin, light/dark tokens).
