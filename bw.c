@@ -37,9 +37,11 @@
  *
  * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
  * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
- * ex1's converged counts table. Per size a warmup batch rides the same
- * windowed stream ahead of the timed batch, then the timed batch of RDMA
- * WRITEs: K WRs posted per ibv_post_send as a linked list (W=256, K=64
+ * ex1's converged counts table. The warmup batch (ex1-inherited) is
+ * zeroed since the audit (issue #19): its wire time lands inside the
+ * ack-stopped window, distorting the report (see WARMUP_COUNTS). Then the
+ * timed batch of RDMA WRITEs: K WRs posted per ibv_post_send as a linked
+ * list (W=256, K=64
  * by default), only the K-th WR of the stream signaled — one CQE per K
  * WRs, so completions are accounted in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
@@ -107,8 +109,7 @@
 
 /* The ex1 converged counts table, verbatim: one entry per size of the
  * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
- * (throughput variance < 1% between doubled counts); WARMUP_COUNTS from
- * ex1's warmup probe. */
+ * (throughput variance < 1% between doubled counts). */
 static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         1310720, 81920, 655360, 163840, 327680, /* 1B 2B 4B 8B 16B */
         20480, 81920, 81920, 40960, 20480,      /* 32B 64B 128B 256B 512B */
@@ -117,8 +118,17 @@ static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         80                                       /* 1MB */
 };
 
+/* Zeroed warmup (measurement fix, 2026-08-07, issue #19): the warmup's
+ * wire time lands inside the ack-stopped window (the clock runs t0..ack,
+ * ADR-0003, and the ack rides behind every WRITE), so each DMA size
+ * under-reported by its warmup share — up to 4.8% at 1 MB (the "1 MB
+ * dip"). Measured on mlxstud03/04 (campaign #19): at any (n, w) the
+ * reported rate is exactly R·n/(n+w); warmup=0 reports the true flat rate
+ * (1 MB 40.57 -> 42.63; small sizes bit-identical), while raising the
+ * warmup makes it worse (warmup=W -> R·n/(n+W), a collapse at 1 MB). The
+ * timed counts (MSG_COUNTS) remain ex1's, verbatim. */
 static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
-        16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
 /* The sweep loop (bw_client_bench) indexes both tables by seq 0..20; an
@@ -848,12 +858,10 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
 
 /* The client's streaming data-path state for one size: the windowed
  * pipeline (ADR-0002). posted counts every WR of the size's stream
- * (warmup + timed) so the signal schedule can pick the K-th WRs;
- * outstanding is posted minus the WRs the refill has reclaimed — exactly
- * K per reclaimed CQE, because only K-th WRs are signaled and RC
- * completions are in-order; the warmup residual (warmup counts are below
- * K, so the warmup itself yields no CQEs) is covered by the first
- * multiple-of-K CQE, which the refill consumes; only the final list's
+ * (the timed batch; the warmup is zeroed, issue #19) so the signal
+ * schedule can pick the K-th WRs; outstanding is posted minus the WRs the
+ * refill has reclaimed — exactly K per reclaimed CQE, because only K-th
+ * WRs are signaled and RC completions are in-order; only the final list's
  * remainder is covered by the CQEs the ack wait consumes. Scoped to one
  * size: the ack wait consumes the remaining data
  * and done completions without touching the state, so it must not
@@ -975,10 +983,11 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* Client side of the full sweep: per size, the warmup batch of WRITEs
- * rides the windowed stream ahead of the timed batch — the clock starts
- * at the first timed post and stops at the ack-receive completion
- * (ADR-0003) — closed by the done SEND. The done needs one free SQ slot:
+/* Client side of the full sweep: per size, the timed batch of WRITEs
+ * rides the windowed stream (the warmup batch is zeroed since the audit,
+ * issue #19) — the clock starts at the first timed post and stops at the
+ * ack-receive completion (ADR-0003) — closed by the done SEND. The done
+ * needs one free SQ slot:
  * the refill leaves at most W - 1 + K ≤ sq_depth - 1 WRs outstanding
  * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
  * passes the data and done-send completions through; the 21 acks consume

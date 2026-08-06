@@ -9,7 +9,7 @@ The `MSG_COUNTS[i]` RDMA WRITEs of one size whose transmission is timed; its ela
 _Avoid_: iteration, run, test
 
 **Warmup batch**:
-The `WARMUP_COUNTS[i]` WRITEs sent before the timed batch, pipelined with it so the pipe is full when the clock starts.
+The `WARMUP_COUNTS[i]` WRITEs sent before the timed batch — all zero since the audit (issue #19): the warmup's wire time lands inside the ack-stopped window (the ack rides behind every WRITE), so each DMA size under-reported by its warmup share (up to 4.8% at 1 MB, the ex1-inherited "1 MB dip"). Measured on mlxstud03/04: warmup=0 reports the true flat rate.
 _Avoid_: pre-test, priming
 
 **Size sweep**:

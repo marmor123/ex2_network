@@ -224,6 +224,44 @@ component that crosses the host interface.
    - `lscpu | grep "Model name"` and, if present, `mstflint -d mlx4_0 q` for HCA
      firmware/PSID.
 
+## Update (2026-08-07, ticket 19 campaign, final pair)
+
+The measurement campaign (issue #19, `docs/research/warmup-counts-campaign.md`)
+resolved the open questions:
+
+**Warmup — the fix is applied.** warmup=0 everywhere (bw.c `WARMUP_COUNTS`,
+branch `improve/warmup-zero`). The viva note above predicted it: 1 MB reports
+the true flat rate, measured **42.63** (40.57 before, +5.1%; CV ≈ 0.2%);
+32 KB–1 MB now flat at ~42.6; small sizes bit-identical (1 B 48.98 vs 48.97).
+The model `reported = R·n/(n+w)` was verified at five counts (80/640/2560/
+5120/10240) and at w = 0/4/256 — including the falsification of the ticket-18
+"warmup ≥ W recovers ~1.76 Gbps" claim: warmup=256 makes 1 MB report
+**10.15 Gbps** (model R·80/336 = 10.14; the claim's ~42.5 is 4.2× off). A
+larger warmup *adds* to the ack-stopped window; only 0 hides nothing.
+
+**2 KB — the count-dependence was dev-pair-only; the floor is reinstated for
+the final pair.** Final-pair per-message time at 2 KB = wire (385 ns) + ack/n
++ **~112 ± 5 ns** at *every* count tested (80 → 620 ns, 640 → 512, 2560 →
+500, 5120 → 504, 10240 → 503, 20480 → 502) — count-independent. The dev
+pair's ticket-18 pattern (excess ~0 @ 640/80, ~60 ns @ 20480) does not
+reproduce; the two pairs differ. The original ticket-13 "~490–500 ns
+per-message floor" stands on the final pair (496–512 ns total per message).
+
+**Intermediate sizes — the excess is non-monotone; no simple model fits.**
+Excess over wire time at count 20480 (warmup 0/4, reproducible across 8
+runs per point): 1536 B +73 ns, 2048 B +117, 2560 B +50, 3072 B +25,
+3584 B +60, 4096 B ≈ +4. Neither the additive-112 ns model nor the
+496 ns floor fits (the ticket-13 prediction of ~24.5 Gbps at 1.5 KB is
+falsified: measured 33.95). The 3584 B re-rise is real. Mechanism open —
+HCA-internal (mlx4 WQE/payload-fetch pipeline); no user-side parameter
+(count, warmup, W/K) touches it. The 2 KB ramp stays in the envelope as a
+documented measurement property.
+
+**Secondary:** the final pair's control round trip ≈ 5–7 µs (ADR-0003's
+~10 µs was the dev pair); all points fit the model within ±0.3%, with a
+count-correlated +0.2–0.3% residual at counts ≤ 2560 (sub-threshold,
+unmodeled) and a ~0.4% dip at 4 KB in every run.
+
 ## Sources
 
 - `bw.c` — counts table (`MSG_COUNTS`/`WARMUP_COUNTS`, lines 111–121), inline
