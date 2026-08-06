@@ -35,11 +35,15 @@
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
  *
- * Stage 4 (T4): the full sweep with the naive WRITE data path. The client
- * runs the 21-size sweep (1 B..1 MB, powers of two) with ex1's converged
- * counts table: per size a warmup batch, then the timed batch of signaled
- * RDMA WRITEs — one WR per ibv_post_send, completions polled only when the
- * SQ is full (no window or signal-interval accounting yet; that is T5).
+ * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
+ * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
+ * ex1's converged counts table. Per size a warmup batch rides the same
+ * windowed stream ahead of the timed batch, then the timed batch of RDMA
+ * WRITEs: K WRs posted per ibv_post_send as a linked list (W=256, K=64
+ * by default), only the K-th WR of the stream signaled — one CQE per K
+ * WRs, so completions are accounted in exact multiples of K (RC in-order)
+ * — reclaimed only while the window is full (refill-never-empty, the SQ
+ * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
  * The clock (CLOCK_MONOTONIC) starts at the first timed post and stops at
  * the ack-receive completion (ADR-0003); each size prints an ex1-identical
  * "size\t%.2f\tunit" line with auto-scaled bps→Gbps units. The server's
@@ -134,13 +138,15 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
  * own timeout fires. */
 #define CTRL_POLL_TIMEOUT_SEC 10
 
-/* The SQ depth is the window (W) plus slack: the slack absorbs the warmup
- * WRs riding ahead of the window plus the per-size control SENDs (T5's
- * windowed path). The same depth bounds the naive pipeline of T4 — the
- * most WRs the client can have outstanding at once. */
+/* The SQ depth is the window (W) plus slack: the slack absorbs the last
+ * K-WR list's overshoot of the window (K ≤ QP_SLACK, so the refill leaves
+ * at most W - 1 + K ≤ sq_depth - 1 WRs outstanding) plus the per-size
+ * done SEND, so neither the last data list nor the done can find the SQ
+ * full. K is bounded by QP_SLACK for the same reason. */
 #define QP_SLACK 1024
 
 #define WINDOW_DEFAULT 256
+#define SIGNAL_INTERVAL_DEFAULT 64
 
 /* The largest max_inline_data tried at QP creation. mlx4 — the course
  * hardware — rejects QP creation when the declared value exceeds what its
@@ -831,15 +837,39 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
     return 0;
 }
 
-/* Poll completions until the SQ has room for one more WR. The naive
- * pipeline signals every WR, so any completion frees exactly one slot;
- * a poll returning 0 only means the last WQEs are still in flight, so the
- * poll is retried (briefly) instead of erroring. During the data path
- * only data WRITE completions may be pending here, so anything else is a
- * protocol error. */
-static int bw_ensure_sq_slot(struct bw_context *ctx, int *outstanding)
+/* The client's streaming data-path state for one size: the windowed
+ * pipeline (ADR-0002). posted counts every WR of the size's stream
+ * (warmup + timed) so the signal schedule can pick the K-th WRs;
+ * outstanding is posted minus the WRs the refill has reclaimed — exactly
+ * K per reclaimed CQE, because only K-th WRs are signaled and RC
+ * completions are in-order; the warmup residual and the final list's
+ * remainder are covered by the CQEs the ack wait consumes, never by the
+ * refill. Scoped to one size: the ack wait consumes the remaining data
+ * and done completions without touching the state, so it must not
+ * survive into the next size. */
+struct bw_data_state {
+    uint64_t posted;
+    uint64_t outstanding;
+};
+
+/* Refill-never-empty (ADR-0002): while the window is full, reclaim only
+ * the CQEs that are ready — each data CQE accounts for exactly K WRs,
+ * because only the K-th WR of the stream is signaled and RC completions
+ * are in-order — then return immediately so the caller reposts; the SQ
+ * never empties and the NIC never idles. The second loop condition is
+ * the device-clamped corner: when the SQ was created shallower than
+ * W + K (the max_qp_wr clamp in bw_init_ctx), it keeps room for the next
+ * K-WR list. The final list's CQE is never reclaimed here: no list is
+ * posted after it, so the refill cannot run again; that CQE stays in the
+ * CQ for the ack wait to consume (it precedes the ack, ADR-0003). During
+ * the data path only data WRITE completions may be pending here, so
+ * anything else is a protocol error; a poll returning 0 only means the
+ * last WQEs are still in flight, so the poll is retried. */
+static int bw_refill(struct bw_context *ctx, uint64_t window, uint64_t k,
+                     struct bw_data_state *st)
 {
-    while (*outstanding >= (int) ctx->sq_depth) {
+    while (st->outstanding >= window ||
+           st->outstanding + k >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
@@ -852,46 +882,68 @@ static int bw_ensure_sq_slot(struct bw_context *ctx, int *outstanding)
 
         if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
             return 1;
-        --*outstanding;
+        st->outstanding -= k;
     }
     return 0;
 }
 
 /* Post `n` RDMA WRITEs of `size` bytes into the server's registered
- * buffer, one WR per ibv_post_send, each signaled. The naive pipeline:
- * no window or signal-interval accounting (that is T5) — the SQ itself is
- * the pipe, kept full by bw_ensure_sq_slot. `outstanding` tracks WRs
- * posted but not yet completed. */
+ * buffer, as a stream of K-WR linked lists, one per ibv_post_send (the
+ * last list takes the remainder). Signal schedule: the K-th WR of the
+ * size's stream (t % k == 0) and the stream's final WR — mid-stream
+ * lists therefore yield one CQE per K WRs, while the warmup residual and
+ * the final remainder are accounted exactly (in-order RC). Messages ≤
+ * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
+ * the registered buffer. `wrs`/`sges` are the caller's K-deep WR arrays,
+ * reused for every list. `final` marks the call that posts the stream's
+ * last list (the timed one). */
 static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
-                          size_t size, uint64_t n, int *outstanding)
+                          size_t size, uint64_t n, uint64_t window,
+                          uint64_t k, struct ibv_send_wr *wrs,
+                          struct ibv_sge *sges, struct bw_data_state *st,
+                          int final)
 {
+    uint32_t inline_flag =
+            size <= ctx->max_inline_data ? IBV_SEND_INLINE : 0;
+
     while (n > 0) {
-        struct ibv_sge sge = {
-                .addr	= (uint64_t) ctx->buf,
-                .length = size,
-                .lkey	= ctx->mr->lkey
-        };
-        struct ibv_send_wr wr = {
-                .wr_id	    = BW_DATA_WRID,
-                .opcode	    = IBV_WR_RDMA_WRITE,
-                .send_flags = IBV_SEND_SIGNALED,
-                .sg_list    = &sge,
-                .num_sge    = 1,
-                .next	    = NULL
-        };
+        uint64_t chunk = n < k ? n : k;
         struct ibv_send_wr *bad_wr;
+        uint64_t i;
 
-        wr.wr.rdma.remote_addr = dest->buf_addr;
-        wr.wr.rdma.rkey = dest->rkey;
-
-        if (bw_ensure_sq_slot(ctx, outstanding))
+        if (bw_refill(ctx, window, k, st))
             return 1;
-        if (ibv_post_send(ctx->qp, &wr, &bad_wr)) {
-            fprintf(stderr, "Couldn't post data WRITE\n");
+
+        for (i = 0; i < chunk; ++i) {
+            uint64_t t = st->posted + i + 1; /* this WR's position in the stream */
+            uint32_t signal =
+                    (t % k == 0) || (final && n == chunk && i == chunk - 1);
+
+            sges[i] = (struct ibv_sge) {
+                    .addr	= (uint64_t) ctx->buf,
+                    .length = size,
+                    .lkey	= ctx->mr->lkey
+            };
+            wrs[i] = (struct ibv_send_wr) {
+                    .wr_id	    = BW_DATA_WRID,
+                    .opcode	    = IBV_WR_RDMA_WRITE,
+                    .send_flags = inline_flag |
+                                  (signal ? IBV_SEND_SIGNALED : 0),
+                    .sg_list    = &sges[i],
+                    .num_sge    = 1,
+                    .next	    = i + 1 < chunk ? &wrs[i + 1] : NULL
+            };
+            wrs[i].wr.rdma.remote_addr = dest->buf_addr;
+            wrs[i].wr.rdma.rkey = dest->rkey;
+        }
+
+        if (ibv_post_send(ctx->qp, &wrs[0], &bad_wr)) {
+            fprintf(stderr, "Couldn't post data WRITEs\n");
             return 1;
         }
-        ++*outstanding;
-        --n;
+        st->posted += chunk;
+        st->outstanding += chunk;
+        n -= chunk;
     }
     return 0;
 }
@@ -912,52 +964,67 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* Client side of the full sweep: per size, the warmup batch of WRITEs,
- * then the timed batch — the clock starts at the first timed post and
- * stops at the ack-receive completion (ADR-0003) — closed by the done
- * SEND. The ack wait passes the data and done-send completions through;
- * the 21 acks consume 21 of the 32 pre-posted control receive pool, never
- * refreshed. */
-static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
+/* Client side of the full sweep: per size, the warmup batch of WRITEs
+ * rides the windowed stream ahead of the timed batch — the clock starts
+ * at the first timed post and stops at the ack-receive completion
+ * (ADR-0003) — closed by the done SEND. The done needs one free SQ slot:
+ * the refill leaves at most W - 1 + K ≤ sq_depth - 1 WRs outstanding
+ * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
+ * passes the data and done-send completions through; the 21 acks consume
+ * 21 of the 32 pre-posted control receive pool, never refreshed.
+ * count_override (-n) replaces the timed count of every size. */
+static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
+                           uint64_t window, uint64_t k, uint64_t count_override)
 {
+    /* The K-deep WR arrays, reused for every linked list of the sweep. */
+    struct ibv_send_wr *wrs;
+    struct ibv_sge *sges;
     uint32_t seq;
+    int rc = 1;
+
+    wrs = calloc(k, sizeof *wrs);
+    sges = calloc(k, sizeof *sges);
+    if (!wrs || !sges) {
+        fprintf(stderr, "Couldn't allocate data batch\n");
+        goto out;
+    }
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
+        uint64_t count = count_override ? count_override : MSG_COUNTS[seq];
         struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
-        /* Scoped to this size's posting: the ack wait consumes the
-         * remaining data and done completions without touching the
-         * counter, so it must not survive into the next size. */
-        int outstanding = 0;
+        struct bw_data_state st = { 0, 0 };
 
-        if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq], &outstanding))
-            return 1;
+        if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq],
+                           window, k, wrs, sges, &st, 0))
+            goto out;
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (bw_post_writes(ctx, dest, size, MSG_COUNTS[seq], &outstanding))
-            return 1;
+        if (bw_post_writes(ctx, dest, size, count,
+                           window, k, wrs, sges, &st, 1))
+            goto out;
 
-        /* The done SEND needs a free SQ slot too. */
-        if (bw_ensure_sq_slot(ctx, &outstanding))
-            return 1;
         if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
-            return 1;
-        ++outstanding;
+            goto out;
 
         if (bw_recv_ctrl(ctx,
                          (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),
                          seq, "Ack", &t1))
-            return 1;
+            goto out;
 
         elapsed = (double) (t1.tv_sec - t0.tv_sec) +
                   (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
-        bw_print_result(size, MSG_COUNTS[seq], elapsed);
+        bw_print_result(size, count, elapsed);
     }
 
-    return 0;
+    rc = 0;
+out:
+    free(sges);
+    free(wrs);
+    return rc;
 }
 
 /* Server side: poll each done off the pre-posted control receive pool —
@@ -1034,8 +1101,13 @@ static void usage(const char *argv0)
     printf("  -p, --port=<port>      handshake port (default 18515)\n");
     printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
     printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-    printf("  -r, --window=<depth>   window depth W: max outstanding data WRs (default %d)\n",
-           WINDOW_DEFAULT);
+    printf("  -r, --window=<depth>   window depth W: refill reclaims once W data WRs\n");
+    printf("                      are outstanding (default %d)\n", WINDOW_DEFAULT);
+    printf("  -k, --signal-interval=<k>  signal every k-th data WR (default %d,\n",
+           SIGNAL_INTERVAL_DEFAULT);
+    printf("                      max min(window, %d))\n", QP_SLACK);
+    printf("  -n, --count=<n>      override the timed-batch count of every size\n");
+    printf("                      (smoke-test the protocol with tiny batches)\n");
     printf("  -g, --gid-idx=<index>  local port gid index (default: LID-based)\n");
 }
 
@@ -1051,6 +1123,8 @@ int main(int argc, char *argv[])
     int                      port = 18515; /* matches usage() */
     int                      ib_port = 1;
     int                      window = WINDOW_DEFAULT;
+    int                      k = SIGNAL_INTERVAL_DEFAULT;
+    uint64_t                 count_override = 0;
     int                      gidx = -1;
 
     srand48(getpid() * time(NULL));
@@ -1063,11 +1137,13 @@ int main(int argc, char *argv[])
                 { .name = "ib-dev",   .has_arg = 1, .val = 'd' },
                 { .name = "ib-port",  .has_arg = 1, .val = 'i' },
                 { .name = "window",   .has_arg = 1, .val = 'r' },
+                { .name = "signal-interval", .has_arg = 1, .val = 'k' },
+                { .name = "count",    .has_arg = 1, .val = 'n' },
                 { .name = "gid-idx",  .has_arg = 1, .val = 'g' },
                 { 0 }
         };
 
-        c = getopt_long(argc, argv, "p:d:i:r:g:", long_options, NULL);
+        c = getopt_long(argc, argv, "p:d:i:r:k:n:g:", long_options, NULL);
         if (c == -1)
             break;
 
@@ -1100,6 +1176,22 @@ int main(int argc, char *argv[])
             }
             break;
 
+        case 'k':
+            k = strtol(optarg, NULL, 0);
+            if (k < 1) {
+                usage(argv[0]);
+                return 1;
+            }
+            break;
+
+        case 'n':
+            count_override = strtoull(optarg, NULL, 0);
+            if (count_override < 1) {
+                usage(argv[0]);
+                return 1;
+            }
+            break;
+
         case 'g':
             gidx = strtol(optarg, NULL, 0);
             break;
@@ -1113,6 +1205,14 @@ int main(int argc, char *argv[])
     if (optind == argc - 1)
         servername = strdup(argv[optind]);
     else if (optind < argc) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    /* K is bounded by the window and the slack so the refill's guarantee
+     * holds — after the last batch at most W - 1 + K ≤ sq_depth - 1 WRs
+     * are outstanding, so the done SEND always finds a free SQ slot. */
+    if (k > window || k > QP_SLACK) {
         usage(argv[0]);
         return 1;
     }
@@ -1201,7 +1301,8 @@ int main(int argc, char *argv[])
      * drives one done SEND per size, the server acks each. Both sides
      * verify every sequence counter. */
     if (servername) {
-        if (bw_client_bench(ctx, rem_dest))
+        if (bw_client_bench(ctx, rem_dest, (uint64_t) window, (uint64_t) k,
+                            count_override))
             return 1;
     } else {
         if (bw_server_ctrl_exchange(ctx))

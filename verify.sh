@@ -11,22 +11,30 @@
 # PASS/FAIL report is printed — paste it back into the dev session.
 # This script is a dev workflow tool; it is NOT part of the submission archive.
 #
-# Stage 4 (current): full sweep with the naive WRITE data path.
-#   [4.1] make builds server + client (symlink) with zero warnings
+# Stage 5 (current): full sweep with the streaming data path — window,
+# batched signaling (K WRs per ibv_post_send), refill-never-empty, and
+# IBV_SEND_INLINE (ADR-0002).
+#   [5.1] make builds server + client (symlink) with zero warnings
 #         (-O3 -Wall -Wextra, from a clean tree)
-#   [4.2] server executable, client symlink to server
-#   [4.3] client role only: ./client 127.0.0.1 with no server listening
+#   [5.2] server executable, client symlink to server
+#   [5.3] client role only: ./client 127.0.0.1 with no server listening
 #         exits non-zero, prints nothing (stdout and stderr), no hang
-#   [4.4] both roles: run the two scripts simultaneously on the pair — the
+#   [5.4] both roles: run the two scripts simultaneously on the pair — the
 #         client runs the full sweep (warmup + timed batches of RDMA
 #         WRITEs per size, done/ack per size); the server absorbs the
-#         WRITEs and acks each done; both exit 0
-#   [4.5] client role only: exactly 21 stdout lines matching the ex1 output
+#         WRITEs and acks each done; both exit 0. A QP error on either
+#         side fails this stage here: bad completions print to stderr
+#         (bw_wc_bad) and exit non-zero, which [5.4]/[5.5] reject.
+#   [5.5] client role only: exactly 21 stdout lines matching the ex1 output
 #         contract `size\t%.2f\tunit` (sizes 2^0..2^20 ascending), nothing
 #         on stderr
-#   [4.6] client role only: plausibility — throughput message-rate-bound at
+#   [5.6] client role only: plausibility — throughput message-rate-bound at
 #         small sizes climbing to wire-bound at large sizes (1 MB >= 100x
 #         1 B and >= 10 Gbps), never above the 56 Gb/s link rate
+#   [5.7] client role only: A/B vs the T4 naive data path (ADR-0004) — the
+#         pipeline pays, never regresses: 256 B and 1 KB hold the inline
+#         plateau (~6.4 Gbps measured T4) and 64 KB and 1 MB hold the DMA
+#         envelope (~38 Gbps measured T4), each within a 10% band
 
 set -u
 
@@ -37,7 +45,7 @@ if [ $# -ge 1 ]; then
     peer="$1"
 fi
 
-stage=4
+stage=5
 pass=0
 fail=0
 
@@ -62,7 +70,7 @@ report_unchecked() { # report_unchecked <check> — sweep produced no parseable 
 echo "=== Lab #2 verify: stage $stage ($role side) ==="
 [ "$role" = client ] && echo "    peer: $peer"
 
-# --- [4.1] Build gate (both roles) ------------------------------------------
+# --- [5.1] Build gate (both roles) ------------------------------------------
 
 build_warns=$(make clean >/dev/null 2>&1; make 2>&1 >/dev/null)
 if [ $? -eq 0 ] && [ -z "$build_warns" ]; then
@@ -78,7 +86,7 @@ else
     report "server executable, client symlink to server" FAIL
 fi
 
-# --- [4.3] Graceful failure when no server listens (client role only) -------
+# --- [5.3] Graceful failure when no server listens (client role only) -------
 
 if [ "$role" = client ]; then
     out=$(timeout 10 ./client 127.0.0.1 2>&1)
@@ -94,7 +102,7 @@ if [ "$role" = client ]; then
     fi
 fi
 
-# --- [4.4] Full sweep run (both roles) ---------------------------------------
+# --- [5.4] Full sweep run (both roles) ---------------------------------------
 #
 # Run the two scripts at the same time on the pair: the client streams the
 # WRITEs of each of the 21 sizes (warmup + timed batches) and drives one done
@@ -131,7 +139,7 @@ else
                "exit code $rc, stdout: '$(echo "$out" | head -3)'"
     fi
 
-    # --- [4.5] Output contract: exactly 21 lines, ex1 format, empty stderr --
+    # --- [5.5] Output contract: exactly 21 lines, ex1 format, empty stderr --
 
     nlines=$(printf '%s\n' "$out" | wc -l)
     if [ "$nlines" -eq 21 ]; then
@@ -181,10 +189,13 @@ else
                "'$(echo "$err" | head -3)'"
     fi
 
-    # --- [4.6] Plausibility: message-rate-bound at small sizes, wire-bound
-    # at large sizes, never above the 56 Gb/s link rate (client role only) --
+    # --- [5.6] Plausibility: message-rate-bound at small sizes, wire-bound
+    # at large sizes, never above the 56 Gb/s link rate; [5.7] the A/B vs
+    # the T4 naive envelope (client role only) --
 
     if [ "$nlines" -eq 21 ]; then
+        # Lines 9/11/17/21 are the 256 B, 1 KB, 64 KB and 1 MB sizes
+        # (2^0..2^20 ascending).
         stats=$(printf '%s\n' "$out" | awk '
             function gbps(v, u,   m) {
                 m = 1;
@@ -194,11 +205,14 @@ else
                 return v * m / 1000000000;
             }
             NR == 1  { first = gbps($2 + 0, $3) }
+            NR == 9  { r256  = gbps($2 + 0, $3) }
+            NR == 11 { kb    = gbps($2 + 0, $3) }
+            NR == 17 { b64k  = gbps($2 + 0, $3) }
             NR == 21 { last  = gbps($2 + 0, $3) }
             { v = gbps($2 + 0, $3); if (v > max) max = v }
-            END { printf "%g %g %g", first, last, max }')
+            END { printf "%g %g %g %g %g %g", first, r256, kb, b64k, last, max }')
         set -- $stats
-        first=$1; last=$2; max=$3
+        first=$1; r256=$2; kb=$3; b64k=$4; last=$5; max=$6
 
         if awk -v f="$first" -v l="$last" 'BEGIN { exit (l < f * 100) }'; then
             report "client: 1 MB >= 100x 1 B (rate-bound -> wire-bound)" PASS \
@@ -223,10 +237,59 @@ else
             report "client: never above the 56 Gb/s link rate" FAIL \
                    "peak $max Gbps exceeds the link rate"
         fi
+
+        # --- [5.7] A/B vs the T4 naive data path (ADR-0004) -----------------
+        # The naive path measured a flat ~6.4 Gbps plateau at 256 B..1 KB
+        # (the inline copy) and ~38 Gbps at 2 KB..1 MB (the DMA path), two
+        # runs identical to three digits. The pipeline pays, never
+        # regresses: hold the plateau at both its edges (256 B, 1 KB) and
+        # the DMA envelope at two points — 64 KB engages the full window
+        # (644 WRs fill W=256, unlike 1 MB's 84-WR stream), 1 MB anchors
+        # the wire-bound rate — each within a 10% band, since shared
+        # course nodes can depress a run. The floors guard the measured
+        # rates, not the paths: on this stack the HCA inlines small
+        # messages regardless of the flag (ADR-0004), so the 1 KB floor
+        # holds the plateau, it cannot distinguish inline from DMA.
+
+        if awk -v r256="$r256" 'BEGIN { exit (r256 < 5.76) }'; then
+            report "client: 256 B holds the inline plateau (A/B vs naive)" PASS \
+                   "256 B: $r256 Gbps (T4 naive: ~6.4)"
+        else
+            report "client: 256 B holds the inline plateau (A/B vs naive)" FAIL \
+                   "256 B: $r256 Gbps (T4 naive: ~6.4)"
+        fi
+
+        if awk -v kb="$kb" 'BEGIN { exit (kb < 5.76) }'; then
+            report "client: 1 KB holds the inline plateau (A/B vs naive)" PASS \
+                   "1 KB: $kb Gbps (T4 naive: ~6.4)"
+        else
+            report "client: 1 KB holds the inline plateau (A/B vs naive)" FAIL \
+                   "1 KB: $kb Gbps (T4 naive: ~6.4)"
+        fi
+
+        if awk -v b64k="$b64k" 'BEGIN { exit (b64k < 34.2) }'; then
+            report "client: 64 KB holds the DMA envelope (A/B vs naive)" PASS \
+                   "64 KB: $b64k Gbps (T4 naive: ~38)"
+        else
+            report "client: 64 KB holds the DMA envelope (A/B vs naive)" FAIL \
+                   "64 KB: $b64k Gbps (T4 naive: ~38)"
+        fi
+
+        if awk -v l="$last" 'BEGIN { exit (l < 34.2) }'; then
+            report "client: 1 MB holds the DMA envelope (A/B vs naive)" PASS \
+                   "1 MB: $last Gbps (T4 naive: ~38)"
+        else
+            report "client: 1 MB holds the DMA envelope (A/B vs naive)" FAIL \
+                   "1 MB: $last Gbps (T4 naive: ~38)"
+        fi
     else
         report_unchecked "1 MB >= 100x 1 B (rate-bound -> wire-bound)"
         report_unchecked "1 MB is wire-bound (>= 10 Gbps)"
         report_unchecked "never above the 56 Gb/s link rate"
+        report_unchecked "256 B holds the inline plateau (A/B vs naive)"
+        report_unchecked "1 KB holds the inline plateau (A/B vs naive)"
+        report_unchecked "64 KB holds the DMA envelope (A/B vs naive)"
+        report_unchecked "1 MB holds the DMA envelope (A/B vs naive)"
     fi
 fi
 
