@@ -193,14 +193,21 @@ The 4 KB point sits ~0.4% below its model in every run (42.36–42.39 vs 42.53)
 
 ## Decision & apply (after the data)
 
-1. **Warmup = 0 — applied** (user-approved 2026-08-06): the warmup table goes
-   to zero at every size. B1 measured the change directly on hardware: 1 MB
-   +2.06 Gbps to 42.63, flat with the envelope; small sizes unchanged (the
-   1 B line is 48.98 both ways); CV ≈ 0.2%. The viva story: "the audit found
-   the ex1-inherited warmup's wire time inside the measured window — warmup=0
-   reports the true flat rate; the timed counts remain ex1's, verbatim".
-   Trade-off acknowledged: ADR-0003's ex1-identical methodology is superseded
-   for the warmup batch only.
+1. **Warmup = 0 — applied** (user-approved 2026-08-07): the warmup table goes
+   to zero at every size — branch `improve/warmup-zero` (commit `b43e8d3`),
+   carrying also the CONTEXT.md and dma-regime-shape.md updates; the `-w`
+   flag and intermediate sizes stay on this scratch branch only. B1 measured
+   the change directly on hardware: 1 MB +2.06 Gbps to 42.63, flat with the
+   envelope; small sizes unchanged (the 1 B line is 48.98 both ways); CV ≈
+   0.2%. The viva story: "the audit found the ex1-inherited warmup's wire
+   time inside the measured window — warmup=0 reports the true flat rate;
+   the timed counts remain ex1's, verbatim". Trade-off acknowledged:
+   ADR-0003's ex1-identical methodology is superseded for the warmup batch
+   only. The drain-variant alternative (warmup → wait for clear wire → t0)
+   was analyzed and rejected: equivalent to warmup=0 for the window contents
+   (B1 already ran that state — the drain is warmup=0 plus an idle wait),
+   no RDMA-side upside (the MR is pinned at registration; no TCP-era state
+   to warm), and new synchronization surface for an identical number.
 2. **2 KB / 1.5–4 KB excess: no fix — documented.** Count-reduction is dead
    (count-independent), the mechanism is HCA-internal, and the profile is
    non-monotone (module B3). The envelope keeps the 2 KB ramp; the record in
