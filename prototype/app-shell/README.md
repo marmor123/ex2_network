@@ -24,6 +24,7 @@ or the arrow keys (`?variant=A|B|C` in the URL; reload-stable):
 | **A** | Field notes | Code-first, dark. A stop IS the annotated source — concept, why and what-ifs as callouts around the code. Left rail = the spine. | Scroll the code; the annotations are the lesson |
 | **B** | System map | Diagram-first, light. The run as a living picture: client SQ → link → server buffer; stops are nodes. Posting the window has a playable mini-pipeline. | Click the diagram; watch the window fill and refill |
 | **C** | Viva deck | Presentation. Home is a title slide; each stop is a 4-slide deck (concept → code → why → what-if). Viva mode hides answers until you reveal them. | Arrow through it; rehearse the exam |
+| **D** | Studio | Split-screen, Claude-like (cream, white panels, terracotta). Left: code on top, explanation below. Right: a diagram synced to the frame — struct design (linked lists, pointers), the connection, the live traffic. One idea per frame; dotted progress + corner arrows at the bottom. | Step through the frames with the corner arrows; the diagram tracks the code |
 
 Content is shared: home (experiment, roles, envelope chart, spine) and two
 full stops — **The experiment** (ADR-0003 clock window) and **Posting the

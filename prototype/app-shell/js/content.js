@@ -172,6 +172,137 @@ window.APP = {
           a: "The done would be delivered out of order with respect to the WRITEs, so the ack could arrive while the last WRITEs are still on the wire — the clock would stop early and throughput would be overstated. That is why ADR-0001 chose SENDs on the data QP for both control messages.",
         },
       ],
+
+      /* Frames — one idea per screen: code (top-left), explanation
+       * (bottom-left), diagram (right, synced to the frame). */
+      frames: [
+        {
+          id: "run", title: "The run at a glance",
+          diagram: "connection",
+          explain: [
+            "Two processes, one RC queue pair, one direction of traffic. The client drives everything: it posts the WRITEs, runs the clock, prints the results. The server's only data-path job is absorbing WRITEs into its registered 1 MB buffer.",
+            "The QP is the whole link: data WRITEs AND the two control messages per size ride it. TCP exists only for the one-time handshake — LID/QPN/PSN/GID plus the server's buffer address and rkey.",
+          ],
+          why: {
+            adr: "0001",
+            title: "Why control messages ride the data QP",
+            text: "The ack must be a true barrier: RC in-order delivery means it can only arrive after every prior WRITE landed in server memory. Over TCP it would not be ordered against the WRITEs, and the clock could stop early.",
+          },
+        },
+        {
+          id: "batches", title: "One size, two batches",
+          code: {
+            file: "bw.c:1000–1011",
+            lines: [
+              "if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq],",
+              "                   window, k, wrs, sges, &st, 0))",
+              "    goto out;",
+              "",
+              "clock_gettime(CLOCK_MONOTONIC, &t0);",
+              "",
+              "if (bw_post_writes(ctx, dest, size, count,",
+              "                   window, k, wrs, sges, &st, 1))",
+              "    goto out;",
+            ],
+            annotations: {
+              1: "Warmup first: 4–32 WRITEs ride the stream ahead of the timed batch, so the pipe is already flowing when the clock starts.",
+              5: "t0 — the clock starts AFTER the warmup, immediately before the first timed post. Nothing before it counts.",
+              7: "The timed batch: the WRITEs whose elapsed time defines the number.",
+            },
+          },
+          diagram: "timeline",
+          explain: [
+            "Every size gets two batches on one continuous windowed stream. The warmup is small (4–32 WRITEs, inherited from ex1) — its job is to have the pipe moving at t0, not to be measured.",
+            "The timed batch is the size's count from the counts table — 1,310,720 WRITEs at 1 B down to 80 at 1 MB. Its elapsed time becomes the throughput number.",
+          ],
+        },
+        {
+          id: "clock", title: "The clock window",
+          code: {
+            file: "bw.c:1004–1019",
+            lines: [
+              "clock_gettime(CLOCK_MONOTONIC, &t0);",
+              "",
+              "if (bw_recv_ctrl(ctx, (1ull << BW_SEND_DONE_WRID)",
+              "                     | (1ull << BW_DATA_WRID), seq, \"Ack\", &t1))",
+              "    goto out;",
+              "",
+              "elapsed = (double) (t1.tv_sec - t0.tv_sec) +",
+              "          (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;",
+            ],
+            annotations: {
+              1: "t0: before the first timed post.",
+              3: "t1: the ack's receive completion — the clock stops HERE, not at the last post.",
+              4: "While waiting, the data and done-send completions pass through — they precede the ack in the CQ, in order.",
+              6: "Elapsed = ack time − first-post time. The whole batch plus the control round trip is inside the measured window.",
+            },
+          },
+          diagram: "clock-window",
+          explain: [
+            "The measured window is one interval: from the first timed post to the ack's arrival. Why the ack and not the last post? Because a client-side completion only means the HCA sent the message — not that the server's memory holds it.",
+            "The ack is the completion barrier (ADR-0003): RC in-order delivery means the server received the done only after every prior WRITE, and the ack carries that guarantee back. Cost: one ~10 µs control round trip per size — negligible above 1 byte, identical in shape for all.",
+          ],
+          why: {
+            adr: "0003",
+            title: "Why ex1's methodology is preserved",
+            text: "Same window as the TCP exercise ('the clock runs until the ACK arrives') — byte-identical output, class-comparable numbers, and the IB numbers beat ex1's 1 GbE results ~7×.",
+          },
+        },
+        {
+          id: "controls", title: "Done and ack",
+          code: {
+            file: "bw.c:1010–1016",
+            lines: [
+              "if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))",
+              "    goto out;",
+              "",
+              "if (bw_recv_ctrl(ctx,",
+              "                 (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),",
+              "                 seq, \"Ack\", &t1))",
+              "    goto out;",
+            ],
+            annotations: {
+              1: "The done SEND, always signaled: 'all my timed WRITEs are posted'. 8 bytes — tag + sequence counter.",
+              4: "The ack wait: the server's reply, also on the data QP.",
+              6: "seq is the size index 0–20; a mismatch means the exchange desynchronized and the run aborts.",
+            },
+          },
+          diagram: "control-flow",
+          explain: [
+            "Per size, exactly two control messages — the only SENDs in the run besides the data WRITEs. The done closes the timed batch; the ack echoes its sequence counter back.",
+            "The server verifies the done's seq before acking; the client verifies the ack's. Both messages carry the fixed tag 0x4354524c and the sequence counter, so a desync fails loudly instead of corrupting numbers.",
+          ],
+          whatif: {
+            q: "What if the ack were a TCP message?",
+            a: "It would not be ordered against the WRITEs — it could arrive while the last ones are still on the wire, and the clock would stop early. That is exactly why ADR-0001 put both control messages on the data QP.",
+          },
+        },
+        {
+          id: "result", title: "The result line",
+          code: {
+            file: "bw.c:953–965",
+            lines: [
+              "static void bw_print_result(size_t size, uint64_t count, double elapsed) {",
+              "    double bps = (double) size * (double) count * 8.0 / elapsed;",
+              "    if (bps < 1000.0)      printf(\"%zu\\t%.2f\\t%s\\n\", size, bps, \"bps\");",
+              "    else if (bps < 1000000.0)  printf(\"%zu\\t%.2f\\t%s\\n\", size, bps / 1000.0, \"Kbps\");",
+              "    else if (bps < 1000000000.0) printf(\"%zu\\t%.2f\\t%s\\n\", size, bps / 1000000.0, \"Mbps\");",
+              "    else                 printf(\"%zu\\t%.2f\\t%s\\n\", size, bps / 1000000000.0, \"Gbps\");",
+              "}",
+            ],
+            annotations: {
+              1: "bytes × count × 8 bits ÷ seconds — the throughput definition.",
+              2: "Units auto-scale bps → Gbps.",
+              3: "Exactly size, %.2f, unit, and a newline — nothing else. Byte-identical to ex1.",
+            },
+          },
+          diagram: "output-line",
+          explain: [
+            "The whole benchmark reduces to 21 lines: size, throughput in auto-scaled units, and nothing else — no debug prints, no timing internals. The output contract that verify.sh checks.",
+            "Each line is one point on the envelope: this is the 'follow the data' spine's destination — every stop upstream exists to explain how these 21 numbers came out the way they did.",
+          ],
+        },
+      ],
     },
 
     posting: {
@@ -282,6 +413,192 @@ window.APP = {
         {
           q: "What if max_inline_data were bigger (or we didn't declare it)?",
           a: "The inline path carries a per-message payload copy at ~853 MB/s (measured, ADR-0004), which caps messages ≤ max_inline_data at ~6.4–6.55 Gbps. A bigger limit would extend the copy plateau to bigger sizes; without the declaration, the stack still inlines small messages anyway — the measured envelope is identical with and without the flag. The boundary at 1 KB is exactly max_inline_data (research ticket #12).",
+        },
+      ],
+
+      frames: [
+        {
+          id: "window", title: "The window — W = 256",
+          code: {
+            file: "bw.c:868–888",
+            lines: [
+              "while (st->outstanding >= window ||",
+              "       st->outstanding + k >= (uint64_t) ctx->sq_depth) {",
+              "    struct ibv_wc wc;",
+              "    int ne = ibv_poll_cq(ctx->cq, 1, &wc);",
+              "    if (ne == 0) continue;",
+              "    if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID)) return 1;",
+              "    st->outstanding -= k;",
+              "}",
+            ],
+            annotations: {
+              1: "The window test: 256 WRITEs may be outstanding before the refill has to reclaim.",
+              2: "Second condition: the device-clamped SQ depth — keep room for the next K-WR list.",
+              4: "Poll ONE CQE at a time; retry while the CQ is momentarily empty (WRITEs still in flight).",
+              7: "One data CQE = exactly K WRs (in-order RC) — the accounting is exact.",
+            },
+          },
+          diagram: "sq-slots",
+          explain: [
+            "The SQ is a hardware ring that may hold up to W = 256 posted-but-uncompleted WRs. 'Outstanding' is the count the client tracks: posted minus reclaimed.",
+            "The window exists because the wire is far away: it takes ~RTT for a WRITE to be acknowledged by a completion. With W = 256 deep, the client always has work queued — the HCA never runs dry.",
+          ],
+          why: {
+            adr: "0002",
+            title: "Why 256, measured not guessed",
+            text: "W = 256 was the assumed default; the T6 A/B (ADR-0006/0007) pushed 512 and 128 and measured no change at any size — 256 is the measured optimum on this hardware.",
+          },
+        },
+        {
+          id: "signal", title: "K = 64 — the signal schedule",
+          code: {
+            file: "bw.c:912–921",
+            lines: [
+              "for (i = 0; i < chunk; ++i) {",
+              "    uint64_t t = st->posted + i + 1;",
+              "    uint32_t signal = (t % k == 0) ||",
+              "                     (final && n == chunk && i == chunk - 1);",
+              "    wrs[i] = (struct ibv_send_wr) {",
+              "        .wr_id = BW_DATA_WRID, .opcode = IBV_WR_RDMA_WRITE,",
+              "        .send_flags = inline_flag | (signal ? IBV_SEND_SIGNALED : 0),",
+              "        ...",
+            ],
+            annotations: {
+              1: "t = this WR's position in the whole size stream (warmup + timed).",
+              3: "Signal schedule: every K-th WR of the stream …",
+              4: "… plus the stream's very last WR — the remainder's CQE that the ack wait consumes.",
+              7: "Only signaled WRs generate a CQE. The HCA processes every WR; the flag only controls the completion.",
+            },
+          },
+          diagram: "signal-schedule",
+          explain: [
+            "Every K-th WRITE is signaled — 1 CQE per K WRs, so a full window of 256 costs just 4 CQEs. The HCA still does every WRITE; the flag only controls which ones generate completions.",
+            "Why is the accounting exact? RC completions are in-order: CQE #j covers exactly WRs j·K−K+1 … j·K. No per-WR bookkeeping, no guessing.",
+          ],
+          why: {
+            adr: "0002",
+            title: "Why fewer CQEs help",
+            text: "The refill polls the CQ; fewer CQEs means less time polling and more time posting. The measured small-size win over the naive path (+37–67%) is partly this: batching also removed one doorbell per WRITE.",
+          },
+        },
+        {
+          id: "list", title: "The linked list of WRs",
+          code: {
+            file: "bw.c:914–940",
+            lines: [
+              "for (i = 0; i < chunk; ++i) {",
+              "    sges[i] = (struct ibv_sge) {",
+              "        .addr = (uint64_t) ctx->buf, .length = size,",
+              "        .lkey = ctx->mr->lkey };",
+              "    wrs[i] = (struct ibv_send_wr) {",
+              "        .wr_id = BW_DATA_WRID, .opcode = IBV_WR_RDMA_WRITE,",
+              "        .send_flags = inline_flag | (signal ? IBV_SEND_SIGNALED : 0),",
+              "        .sg_list = &sges[i], .num_sge = 1,",
+              "        .next = i + 1 < chunk ? &wrs[i + 1] : NULL };",
+              "    wrs[i].wr.rdma.remote_addr = dest->buf_addr;",
+              "    wrs[i].wr.rdma.rkey = dest->rkey;",
+              "}",
+              "if (ibv_post_send(ctx->qp, &wrs[0], &bad_wr)) return 1;",
+            ],
+            annotations: {
+              2: "One SGE per WR: this WR's data lives at ctx->buf (the 1 MB registered buffer), lkey proves the registration.",
+              5: "The WR itself: opcode RDMA_WRITE, wr_id shared by all data WRITEs so completions stay distinguishable from control messages.",
+              8: "Each WR points at its SGE.",
+              9: "…and at the next WR: the linked list. Last WR's next = NULL.",
+              10: "The remote side of the WRITE: the server's buffer address and rkey, learned in the handshake.",
+              13: "One ibv_post_send call posts the whole list — one doorbell per K WRITEs.",
+            },
+          },
+          diagram: "linked-list",
+          explain: [
+            "ibv_post_send takes a linked list of work requests, not one — that is the whole batching trick. The array wrs[64] is reused for every list; next pointers chain them; the last one ends at NULL.",
+            "Each WR carries a scatter-gather element pointing at the local 1 MB buffer (addr + lkey), and — for RDMA WRITE — the remote address and rkey the server handed over during the handshake.",
+          ],
+          why: {
+            adr: "0002",
+            title: "Why one doorbell per K",
+            text: "The doorbell write to the HCA is per ibv_post_send call. K WRs per call means 64× fewer doorbells — the naive T4 path posted one WR at a time, and the pipeline's small-size win (+37–67%) is the measured difference.",
+          },
+        },
+        {
+          id: "refill", title: "Refill — the SQ never empties",
+          code: {
+            file: "bw.c:900–916",
+            lines: [
+              "while (n > 0) {",
+              "    uint64_t chunk = n < k ? n : k;",
+              "    if (bw_refill(ctx, window, k, st)) return 1;",
+              "    for (i = 0; i < chunk; ++i) {",
+              "        uint64_t t = st->posted + i + 1;",
+              "        ...build wrs[i]...",
+              "    }",
+              "    if (ibv_post_send(ctx->qp, &wrs[0], &bad_wr)) return 1;",
+              "    st->posted += chunk; st->outstanding += chunk; n -= chunk;",
+              "}",
+            ],
+            annotations: {
+              1: "Post loop: one pass per K-WR list, until the size's count n is exhausted.",
+              3: "Refill FIRST — reclaim ready CQEs while the window is full — then post. The SQ never drains to zero.",
+              8: "One doorbell per list.",
+              9: "Accounting: posted counts every WR (signal schedule); outstanding = posted − reclaimed.",
+            },
+          },
+          diagram: "refill-live",
+          explain: [
+            "Refill is the discipline that replaces the template's wait-for-all: reclaim only the CQEs that are ready, then immediately repost. The template drained the SQ to zero every window and re-paid the ramp-up each time.",
+            "The measured consequence (ADR-0005): +37–67% message rate at ≤ 64 B, no regression anywhere. At DMA sizes the naive path was already bus-saturated — the win is localized to where message rate binds.",
+          ],
+          whatif: {
+            q: "What if we kept the template's wait-for-all pattern?",
+            a: "Every window: drain to zero, idle ~an RTT, re-ramp. That was the T4 naive path — the A/B measured exactly this cost and found the refill's gain. Watch the panel: the refill keeps the fill level pinned at W.",
+          },
+        },
+        {
+          id: "remote", title: "Where the WRITE lands",
+          code: {
+            file: "bw.c:936–937",
+            lines: [
+              "wrs[i].wr.rdma.remote_addr = dest->buf_addr;",
+              "wrs[i].wr.rdma.rkey = dest->rkey;",
+            ],
+            annotations: {
+              1: "The server's buffer address — from the handshake message, where the server advertised it (plus rkey).",
+              2: "The rkey proves the server's memory region permits remote writes. Without it the WRITE fails with a protection error.",
+            },
+          },
+          diagram: "remote-write",
+          explain: [
+            "An RDMA WRITE is one-sided: the HCA reads the payload from the client's buffer (DMA read) and writes it into the server's registered memory at remote_addr — with no server CPU, no server context switch, nothing but the server's HCA.",
+            "That is the point of the exercise: the server's data path is a buffer being filled. It cannot even see the data without asking the HCA.",
+          ],
+          why: {
+            adr: "0003",
+            title: "Why the assignment insists on the ack",
+            text: "Because WRITE is one-sided, the client has no natural confirmation — the assignment's warning. The ack (a SEND, which the server's HCA can complete) is the only client-visible proof the data arrived.",
+          },
+        },
+        {
+          id: "inline", title: "Inline vs DMA",
+          code: {
+            file: "bw.c:906–907",
+            lines: [
+              "uint32_t inline_flag =",
+              "        size <= ctx->max_inline_data ? IBV_SEND_INLINE : 0;",
+            ],
+            annotations: {
+              1: "The boundary: messages ≤ the QP's max_inline_data (1024 B here) ride the WQE.",
+              2: "max_inline_data is read back from the created QP — 'we asked the hardware, not a header' (ADR-0002).",
+            },
+          },
+          diagram: "inline",
+          explain: [
+            "Small messages skip the DMA read: the payload rides inside the WQE itself at post time. One less host-memory read per message — at 6.1M msg/s that matters.",
+            "Measured consequence (ADR-0004): the inline path carries a per-message payload copy at ~853 MB/s, capping ≤ 1 KB at ~6.55 Gbps — and the stack inlines small messages even without the flag. The 1 KB boundary on the envelope is exactly max_inline_data.",
+          ],
+          whatif: {
+            q: "What if max_inline_data were larger?",
+            a: "The copy plateau would extend to larger sizes — the measured limit is byte-for-byte the QP's max_inline_data (research ticket #12). On this hardware it is the cost of the small-message path.",
+          },
         },
       ],
     },

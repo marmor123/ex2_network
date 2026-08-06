@@ -16,11 +16,17 @@
 (function () {
   const A = window.APP;
 
-  /* ---------- tiny DOM helper (textContent only — no data through innerHTML) */
+  /* ---------- tiny DOM helper (textContent only — no data through innerHTML).
+   * Third arg: text, a Node, or an array of Nodes/strings to append. */
   function h(tag, cls, text) {
     const el = document.createElement(tag);
     if (cls) el.className = cls;
-    if (text !== undefined) el.textContent = text;
+    if (text !== undefined) {
+      if (text instanceof Node) el.appendChild(text);
+      else if (Array.isArray(text)) {
+        text.forEach((ch) => el.appendChild(ch instanceof Node ? ch : document.createTextNode(String(ch))));
+      } else el.textContent = text;
+    }
     return el;
   }
 
@@ -517,12 +523,420 @@
     deck(root, slides, { home: true });
   }
 
+  /* ---------- Variant D — Studio (split-screen, Claude-like) ------------------ */
+
+  /* Diagram pieces — the right-hand panel: struct design, the connection,
+   * live traffic. One builder per frame. */
+  function dBox(text, cls) { return h("div", "dbox" + (cls ? " " + cls : ""), text); }
+  function dChip(text, cls) { return h("span", "dchip" + (cls ? " " + cls : ""), text); }
+  function dArrow(label, dir) {
+    const a = h("div", "darrow " + dir);
+    if (label !== undefined) a.appendChild(h("span", "darrow-label", label));
+    return a;
+  }
+  function dFig(title, body) {
+    const fig = h("figure", "d-fig");
+    fig.appendChild(h("figcaption", "d-fig-title", title));
+    fig.appendChild(body);
+    return fig;
+  }
+  function dNote(text) { return h("p", "d-note", text); }
+
+  const DIAGRAMS = {
+    /* The run: one QP, one direction, TCP only for the handshake. */
+    connection() {
+      const client = h("div", "d-node");
+      client.appendChild(h("div", "d-node-title", "Client"));
+      client.appendChild(h("div", "d-node-body", "posts WRITEs · runs the clock · prints results"));
+      client.appendChild(h("div", "d-node-chips", [dChip("SQ → CQ"), dChip("1 MB buffer (lkey)"), dChip("done SEND / ack wait")]));
+      const server = h("div", "d-node");
+      server.appendChild(h("div", "d-node-title", "Server"));
+      server.appendChild(h("div", "d-node-body", "absorbs WRITEs · acks each done"));
+      server.appendChild(h("div", "d-node-chips", [dChip("RQ → CQ"), dChip("1 MB buffer (addr + rkey)")]));
+
+      const dataRow = h("div", "d-row");
+      dataRow.appendChild(client);
+      dataRow.appendChild(dArrow("RC QP — RDMA WRITE (data + control SENDs)", "right"));
+      dataRow.appendChild(server);
+
+      const tcp = h("div", "d-tcp");
+      tcp.appendChild(dArrow("TCP handshake, once — lid : qpn : psn : gid + addr : rkey", "right"));
+      const fig = dFig("The connection — what exists before any data flows", dataRow);
+      fig.appendChild(tcp);
+      fig.appendChild(dNote("One QP carries everything: the data WRITEs and the two control SENDs per size. TCP appears exactly once, before data flows (ADR-0001)."));
+      return fig;
+    },
+
+    /* One size: warmup batch then timed batch on one stream. */
+    timeline() {
+      const strip = h("div", "d-strip");
+      const segs = [
+        ["Warmup", "4–32 WRITEs", "warmup"],
+        ["t0", "", "mark"],
+        ["Timed batch", "MSG_COUNTS[seq] WRITEs", "timed"],
+        ["done", "", "mark"],
+        ["RTT", "~10 µs", "rtt"],
+        ["ack → t1", "", "mark"],
+      ];
+      segs.forEach(([t, s, cls]) => {
+        const seg = h("div", "d-seg " + cls);
+        seg.appendChild(h("div", "d-seg-title", t));
+        if (s) seg.appendChild(h("div", "d-seg-sub", s));
+        strip.appendChild(seg);
+      });
+      const fig = dFig("One size on the timeline — the clock runs t0 → t1", strip);
+      fig.appendChild(dNote("The warmup rides the same windowed stream as the timed batch. The control round trip (done → ack) is inside the measured window (ADR-0003)."));
+      return fig;
+    },
+
+    /* The measured window, bracketed. */
+    "clock-window"() {
+      const strip = h("div", "d-strip");
+      [["t0", "", "mark"], ["timed batch", "the WRITEs that count", "timed"], ["done", "", "mark"], ["RTT", "", "rtt"], ["ack", "t1", "mark"]].forEach(([t, s, cls]) => {
+        const seg = h("div", "d-seg " + cls);
+        seg.appendChild(h("div", "d-seg-title", t));
+        if (s) seg.appendChild(h("div", "d-seg-sub", s));
+        strip.appendChild(seg);
+      });
+      const bracket = h("div", "d-bracket", "measured window — the throughput denominator");
+      strip.appendChild(bracket);
+      const fig = dFig("The clock window (ADR-0003) — why it stops at the ack", strip);
+      fig.appendChild(dNote("A client-side completion means sent, not received. The ack is the completion barrier: RC in-order delivery guarantees every prior WRITE is in server memory before it can arrive."));
+      return fig;
+    },
+
+    /* The two control messages, with sequence counters. */
+    "control-flow"() {
+      const client = h("div", "d-node small");
+      client.appendChild(h("div", "d-node-title", "Client"));
+      const server = h("div", "d-node small");
+      server.appendChild(h("div", "d-node-title", "Server"));
+      const done = dArrow("done SEND — tag 0x4354524c, seq = i", "right");
+      const ack = dArrow("ack SEND — echoes seq = i", "left");
+      const row1 = h("div", "d-row");
+      row1.appendChild(client);
+      row1.appendChild(done);
+      row1.appendChild(server);
+      const row2 = h("div", "d-row");
+      const spacer = h("div", "dbox ghost");
+      row2.appendChild(spacer);
+      row2.appendChild(ack);
+      const fig = dFig("Per size: exactly two control messages, both on the data QP", row1);
+      fig.appendChild(row2);
+      fig.appendChild(dNote("Both sides verify tag and sequence counter — a mismatch means the exchange desynchronized and the run aborts instead of printing corrupt numbers."));
+      return fig;
+    },
+
+    /* The result line anatomy. */
+    "output-line"() {
+      const chip = h("div", "d-outline");
+      const line = h("div", "d-out-line", "1024\t6.55\tGbps");
+      const labels = h("div", "d-out-labels");
+      labels.appendChild(h("span", "", "size"));
+      labels.appendChild(h("span", "", "throughput"));
+      labels.appendChild(h("span", "", "unit"));
+      chip.appendChild(line);
+      chip.appendChild(labels);
+      const fig = dFig("One line per size — the whole benchmark reduces to this", chip);
+      fig.appendChild(dNote("size × count × 8 ÷ elapsed seconds, auto-scaled bps → Gbps. Byte-identical to ex1; the 21 lines are the envelope you see on the home page."));
+      return fig;
+    },
+
+    /* The SQ as 256 slots. */
+    "sq-slots"() {
+      const grid = h("div", "d-slots");
+      for (let i = 0; i < 256; i++) {
+        const cell = h("div", "d-slot" + (i < 192 ? " filled" : ""));
+        if (i === 255) cell.classList.add("edge");
+        grid.appendChild(cell);
+      }
+      const fig = dFig("The SQ — up to W = 256 posted-but-uncompleted WRs", grid);
+      fig.appendChild(h("div", "d-slot-legend", "filled = outstanding (here 192/256) · the refill keeps it pinned near W, never empties"));
+      fig.appendChild(dNote("The window exists because the wire is far: it takes ~RTT for a WRITE's completion to come back. 256 deep means the HCA always has work queued."));
+      return fig;
+    },
+
+    /* K = 64: signal every 64th WQE. */
+    "signal-schedule"() {
+      const row = h("div", "d-wqe-row");
+      for (let i = 1; i <= 256; i++) {
+        const w = h("div", "d-wqe" + (i % 64 === 0 ? " signaled" : "") + (i === 256 ? " last" : ""));
+        if (i % 64 === 0) w.appendChild(h("span", "d-wqe-s", "S"));
+        row.appendChild(w);
+      }
+      const cqes = h("div", "d-wqe-cqes");
+      [64, 128, 192, 256].forEach((n) => cqes.appendChild(h("div", "d-wqe-cqe", "CQE #" + (n / 64))));
+      const fig = dFig("The signal schedule — 256 WRITEs, 4 completions", row);
+      fig.appendChild(cqes);
+      fig.appendChild(dNote("Only signaled WRs generate CQEs. In-order RC completions make the accounting exact: CQE #j covers exactly WRs j·K−K+1 … j·K."));
+      return fig;
+    },
+
+    /* Struct design: the linked list of ibv_send_wr. */
+    "linked-list"() {
+      const wrRow = h("div", "d-wr-row");
+      for (let i = 0; i < 3; i++) {
+        const wr = h("div", "d-wr");
+        wr.appendChild(h("div", "d-wr-name", "wrs[" + i + "]"));
+        wr.appendChild(h("div", "d-wr-field", "opcode = RDMA_WRITE"));
+        wr.appendChild(h("div", "d-wr-field", "send_flags = SIGNALED?"));
+        wr.appendChild(h("div", "d-wr-ptr", "sg_list →"));
+        wr.appendChild(h("div", "d-wr-ptr", "next →"));
+        wrRow.appendChild(wr);
+        if (i < 2) wrRow.appendChild(dArrow("", "right"));
+        else wrRow.appendChild(h("div", "d-wr-null", "NULL"));
+      }
+      const sge = h("div", "d-sge");
+      sge.appendChild(h("div", "d-sge-title", "ibv_sge"));
+      sge.appendChild(h("div", "d-sge-field", "addr = ctx->buf (1 MB)"));
+      sge.appendChild(h("div", "d-sge-field", "length = size"));
+      sge.appendChild(h("div", "d-sge-field", "lkey = mr->lkey"));
+      const buf = dBox("1 MB registered buffer — never modified", "buf");
+      const remote = h("div", "d-remote");
+      remote.appendChild(h("div", "d-remote-title", "server memory"));
+      remote.appendChild(h("div", "d-remote-field", "remote_addr = dest->buf_addr"));
+      remote.appendChild(h("div", "d-remote-field", "rkey = dest->rkey"));
+      const fig = dFig("One linked list per ibv_post_send — the data structures", wrRow);
+      fig.appendChild(h("div", "d-row", [dArrow("sg_list", "down"), sge, dArrow("addr/lkey", "down"), buf]));
+      fig.appendChild(h("div", "d-row", [dArrow("wr.rdma", "right"), remote]));
+      fig.appendChild(dNote("next chains the K WRs; the last next = NULL. One doorbell covers the whole list — that batching is the pipeline's small-size win (ADR-0002/0005)."));
+      return fig;
+    },
+
+    /* Live: the refill keeps the SQ pinned near W. */
+    "refill-live"() {
+      const bar = h("div", "d-live-bar");
+      const fill = h("div", "d-live-fill");
+      bar.appendChild(fill);
+      const label = h("div", "d-live-label", "outstanding: 256 / 256");
+      const cq = h("div", "d-live-cq");
+      cq.appendChild(h("div", "d-live-cq-title", "CQ — completions ready"));
+      const cqeRow = h("div", "d-live-cqes");
+      [1, 2, 3, 4].forEach(() => cqeRow.appendChild(h("div", "d-live-cqe", "CQE")));
+      cq.appendChild(cqeRow);
+
+      const wire = h("div", "d-live-wire");
+      const pkt = h("div", "d-live-pkt");
+      wire.appendChild(pkt);
+
+      const controls = h("div", "d-live-controls");
+      const play = h("button", "btn", "▶ Play");
+      const step = h("button", "btn", "Step");
+      controls.appendChild(play);
+      controls.appendChild(step);
+
+      const desc = h("p", "d-live-desc", "The refill runs at the head of each list post: poll ready CQEs, reclaim, post the next list.");
+
+      const PHASES = [
+        { out: 256, cqes: 0, wire: false, d: "Post a K = 64 list — one doorbell. Outstanding is back to 256." },
+        { out: 256, cqes: 0, wire: true, d: "The HCA DMA-reads the buffer; the WRITEs cross the link." },
+        { out: 256, cqes: 4, wire: false, d: "4 CQEs are ready — one per 64 WRs (in-order, exact)." },
+        { out: 192, cqes: 0, wire: false, d: "Refill reclaims: outstanding −= K. The SQ is still full enough to keep posting — it never drains to zero." },
+      ];
+      let i = 0, timer = null;
+      function apply() {
+        const ph = PHASES[i % PHASES.length];
+        fill.style.width = (ph.out / 256 * 100) + "%";
+        label.textContent = "outstanding: " + ph.out + " / 256";
+        cqeRow.textContent = "";
+        for (let n = 0; n < ph.cqes; n++) cqeRow.appendChild(h("div", "d-live-cqe", "CQE"));
+        pkt.classList.toggle("moving", ph.wire);
+        desc.textContent = ph.d;
+      }
+      function tick() { i++; apply(); }
+      play.addEventListener("click", () => {
+        if (timer) { clearInterval(timer); timer = null; play.textContent = "▶ Play"; return; }
+        timer = setInterval(tick, 950);
+        play.textContent = "⏸ Pause";
+      });
+      step.addEventListener("click", tick);
+      apply();
+
+      const fig = dFig("The refill, live — why the NIC never idles", h("div", "d-live", [bar, label, wire, cq, controls, desc]));
+      fig.appendChild(dNote("The template's wait-for-all drained the SQ to zero every window and re-paid the ramp. The refill polls only what's ready and posts again immediately."));
+      return fig;
+    },
+
+    /* One-sided write into server memory. */
+    "remote-write"() {
+      const clientMem = dBox("client: 1 MB buffer", "mem");
+      const hca1 = dBox("client HCA", "hca");
+      const hca2 = dBox("server HCA", "hca");
+      const serverMem = dBox("server: 1 MB buffer @ remote_addr", "mem");
+      const row = h("div", "d-row");
+      row.appendChild(h("div", "d-col", [clientMem, dArrow("DMA read", "down")]));
+      row.appendChild(dArrow("RDMA WRITE — FDR link", "right"));
+      row.appendChild(h("div", "d-col", [dArrow("writes straight in", "down"), serverMem]));
+      const fig = dFig("An RDMA WRITE is one-sided", row);
+      fig.appendChild(dNote("The server's CPU never sees the data — its HCA writes the payload into the registered buffer at remote_addr, gated by rkey. The ack is the only confirmation the client can get (ADR-0003)."));
+      return fig;
+    },
+
+    /* Inline vs DMA. */
+    inline() {
+      const inlineWqe = h("div", "d-wqe-big");
+      inlineWqe.appendChild(h("div", "d-wqe-big-title", "Inline WQE — ≤ 1024 B"));
+      inlineWqe.appendChild(h("div", "d-wqe-big-field", "payload rides inside the WQE"));
+      inlineWqe.appendChild(h("div", "d-wqe-big-field", "IBV_SEND_INLINE"));
+      const dmaWqe = h("div", "d-wqe-big");
+      dmaWqe.appendChild(h("div", "d-wqe-big-title", "DMA WQE — > 1024 B"));
+      dmaWqe.appendChild(h("div", "d-wqe-big-field", "SGE → 1 MB buffer"));
+      dmaWqe.appendChild(h("div", "d-wqe-big-field", "HCA DMA-reads the payload"));
+      const row = h("div", "d-row");
+      row.appendChild(inlineWqe);
+      row.appendChild(h("div", "d-arrow-note", "vs"));
+      row.appendChild(dmaWqe);
+      const fig = dFig("Two paths to the wire — the 1 KB boundary is max_inline_data", row);
+      fig.appendChild(dNote("Measured (ADR-0004): the inline path carries a per-message payload copy at ~853 MB/s, capping ≤ 1 KB at ~6.55 Gbps. The stack inlines small messages even without the flag."));
+      return fig;
+    },
+  };
+
+  function renderStopD(root, stop) {
+    root.classList.add("vd");
+
+    /* Top bar: place + cross-stop navigation. */
+    const top = h("header", "d-top");
+    const leftPart = h("div", "d-top-left");
+    const home = h("a", "d-top-home", "← All stops");
+    home.href = "#home";
+    leftPart.appendChild(home);
+    leftPart.appendChild(h("div", "d-top-title", stop.title));
+    leftPart.appendChild(h("span", "d-top-kicker", stop.group + " · ADR " + stop.adrs.join(", ")));
+    top.appendChild(leftPart);
+
+    const built = A.spine.filter((s) => s.state === "built");
+    const si = built.findIndex((s) => s.id === stop.id);
+    const rightPart = h("div", "d-top-right");
+    if (si > 0) {
+      const p = h("a", "d-top-nav", "← " + built[si - 1].title);
+      p.href = "#stop=" + built[si - 1].id;
+      rightPart.appendChild(p);
+    }
+    if (si < built.length - 1) {
+      const n = h("a", "d-top-nav", built[si + 1].title + " →");
+      n.href = "#stop=" + built[si + 1].id;
+      rightPart.appendChild(n);
+    }
+    top.appendChild(rightPart);
+    root.appendChild(top);
+
+    const frames = stop.frames;
+    let idx = 0;
+
+    const grid = h("div", "d-grid");
+    const left = h("div", "d-left");
+    const codePanel = h("section", "d-panel d-code-panel");
+    const explainPanel = h("section", "d-panel d-explain-panel");
+    const diagramPanel = h("aside", "d-panel d-diagram-panel");
+    left.appendChild(codePanel);
+    left.appendChild(explainPanel);
+    grid.appendChild(left);
+    grid.appendChild(diagramPanel);
+    root.appendChild(grid);
+
+    /* Bottom strip: dotted progress + frame title; corner arrows are fixed. */
+    const bottom = h("div", "d-bottom");
+    const dots = h("div", "d-dots");
+    const frameTitle = h("span", "d-frame-title");
+    const counter = h("span", "d-counter");
+    bottom.appendChild(dots);
+    bottom.appendChild(frameTitle);
+    bottom.appendChild(counter);
+    root.appendChild(bottom);
+
+    const prevBtn = h("button", "d-corner prev", "‹");
+    prevBtn.title = "Previous frame";
+    const nextBtn = h("button", "d-corner next", "›");
+    nextBtn.title = "Next frame";
+    document.body.appendChild(prevBtn);
+    document.body.appendChild(nextBtn);
+
+    function renderFrame() {
+      const f = frames[idx];
+      dots.textContent = "";
+      frames.forEach((fr, i) => {
+        const dot = h("button", "d-dot" + (i === idx ? " on" : ""));
+        dot.title = fr.title;
+        dot.addEventListener("click", () => { idx = i; renderFrame(); });
+        dots.appendChild(dot);
+      });
+      frameTitle.textContent = f.title;
+      counter.textContent = (idx + 1) + " / " + frames.length;
+
+      /* Left-top: code, or the stop's concept when the frame has no code. */
+      codePanel.textContent = "";
+      if (f.code) {
+        codePanel.appendChild(h("h2", "d-panel-title", "The code — " + f.code.file));
+        codePanel.appendChild(codeBlock({ code: f.code }, true));
+      } else {
+        codePanel.appendChild(h("h2", "d-panel-title", "The setup"));
+        stop.concept.forEach((p) => codePanel.appendChild(h("p", "body", p)));
+        codePanel.appendChild(termTable(stop));
+      }
+
+      /* Left-bottom: the explanation for this frame. */
+      explainPanel.textContent = "";
+      explainPanel.appendChild(h("h2", "d-panel-title", "What's happening"));
+      f.explain.forEach((p) => explainPanel.appendChild(h("p", "body", p)));
+      if (f.why) {
+        const why = h("div", "d-side-card");
+        why.appendChild(h("span", "adr-badge", f.why.adr));
+        why.appendChild(h("h3", "", f.why.title));
+        why.appendChild(h("p", "", f.why.text));
+        explainPanel.appendChild(why);
+      }
+      if (f.whatif) {
+        const wi = h("div", "d-side-card whatif");
+        wi.appendChild(h("h3", "", f.whatif.q));
+        wi.appendChild(h("p", "", f.whatif.a));
+        explainPanel.appendChild(wi);
+      }
+
+      /* Right: the diagram for this frame. */
+      diagramPanel.textContent = "";
+      const diag = DIAGRAMS[f.diagram]();
+      diagramPanel.appendChild(h("div", "d-diagram-sticky", [diag]));
+    }
+
+    function nav(dir) { idx = Math.max(0, Math.min(frames.length - 1, idx + dir)); renderFrame(); }
+    prevBtn.addEventListener("click", () => nav(-1));
+    nextBtn.addEventListener("click", () => nav(1));
+    root._frameNav = { next: () => nav(1), prev: () => nav(-1) };
+
+    renderFrame();
+  }
+
+  function renderHomeD(root) {
+    root.classList.add("vd");
+    const hero = h("div", "d-home");
+    const kick = h("p", "kicker", "Lab 2 · Verbs API throughput");
+    hero.appendChild(kick);
+    hero.appendChild(h("h1", "d-home-title", A.title));
+    hero.appendChild(h("p", "d-home-lead", A.home.lead));
+    hero.appendChild(h("div", "d-home-chart", [envelopeEl()]));
+    hero.appendChild(h("h2", "d-home-h2", "Follow the data — pick a stop"));
+    const nav = h("div", "d-home-spine");
+    A.spine.forEach((s) => {
+      if (s.state !== "built") {
+        nav.appendChild(h("div", "d-home-planned", "· " + s.title));
+        return;
+      }
+      const a = h("a", "d-home-stop", s.group + " — " + s.title);
+      a.href = "#stop=" + s.id;
+      nav.appendChild(a);
+    });
+    hero.appendChild(nav);
+    root.appendChild(hero);
+  }
+
   /* ---------- Router ---------------------------------------------------------- */
 
   const VARIANTS = {
     A: { name: "Field notes", theme: "dark", home: renderHomeA, stop: renderStopA },
     B: { name: "System map", theme: "light", home: renderHomeB, stop: renderStopB },
     C: { name: "Viva deck", theme: "light", home: renderHomeC, stop: renderStopC },
+    D: { name: "Studio", theme: "studio", home: renderHomeD, stop: renderStopD },
   };
 
   function currentVariant() {
@@ -538,6 +952,8 @@
 
   const mount = document.getElementById("app");
   function render() {
+    /* Variant D's fixed corner arrows live on <body> — drop stale ones. */
+    document.querySelectorAll(".d-corner").forEach((el) => el.remove());
     const v = currentVariant();
     const route = currentRoute();
     mount.className = "";
@@ -586,12 +1002,13 @@
     setVariant(keys[(i + 1) % keys.length]);
   });
 
-  /* Keyboard: ←/→ cycle variants, EXCEPT inside the viva deck (variant C),
-   * which owns them for slide navigation. */
+  /* Keyboard: ←/→ cycle variants, EXCEPT in the viva deck (C) and the studio
+   * frames (D), which own the arrows for their own navigation. */
   document.addEventListener("keydown", (e) => {
-    if (currentVariant().name === VARIANTS.C.name && mount._deckNav) {
-      if (e.key === "ArrowRight") mount._deckNav.next();
-      if (e.key === "ArrowLeft") mount._deckNav.prev();
+    const own = mount._deckNav || mount._frameNav;
+    if (own) {
+      if (e.key === "ArrowRight") own.next();
+      if (e.key === "ArrowLeft") own.prev();
       return;
     }
     if (e.key === "ArrowRight") right.click();
