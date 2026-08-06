@@ -1,4 +1,4 @@
-# T6 final campaign on mlxstud03/04 (ADR-0007)
+# T6 final campaign on mlxstud03/04
 
 The final measurement runs (issue #7, criterion 4) — the same stage-6 verify campaign as ADR-0006, run with `--final` on the assignment's recommended pair. Report: 26/26 client-side, 11/11 server-side, no QP errors.
 

@@ -20,30 +20,30 @@
 # instance is up, so the two scripts need not start at exactly the same time.
 #   [6.1] make builds server + client (symlink) with zero warnings
 #         (-O3 -Wall -Wextra, from a clean tree); client symlink to server
-#   [6.3] client role only: ./client 127.0.0.1 with no server listening
+#   [6.2] client role only: ./client 127.0.0.1 with no server listening
 #         exits non-zero, prints nothing (stdout and stderr), no hang
-#   [6.4] both roles: all 9 sweeps run — per sweep, exit 0 and the client's
+#   [6.3] both roles: all 9 sweeps run — per sweep, exit 0 and the client's
 #         output is exactly the 21-line ex1 contract `size\t%.2f\tunit`
 #         (sizes 2^0..2^20 ascending), nothing on stderr. A QP error on
 #         either side fails its sweep here: bad completions print to stderr
 #         and exit non-zero.
-#   [6.5] client role only: variance across the 3 default-parameter sweeps
+#   [6.4] client role only: variance across the 3 default-parameter sweeps
 #         at the large sizes (64 KB and 1 MB) < 1% (coefficient of
 #         variation) — the acceptance criterion ">= 3 full sweeps with
 #         <1% variance at the large sizes"
-#   [6.6] client role only: message-rate-bound scaling — in every sweep,
+#   [6.5] client role only: message-rate-bound scaling — in every sweep,
 #         each size 1..32 B doubles throughput within +/-10% (the 5
 #         doublings 2^0..2^5), the expected small-size regime
-#   [6.7] client role only: the default-parameter envelope holds the
+#   [6.6] client role only: the default-parameter envelope holds the
 #         measured floors (ADR-0004/0005: 256 B and 1 KB >= 5.76 Gbps, the
 #         inline plateau; 64 KB and 1 MB >= 34.2 Gbps, the DMA envelope),
 #         1 MB >= 100x 1 B, peak never above the 56 Gb/s link rate
-#   [6.8] client role only: parameter A/B — no alternative parameter set
+#   [6.7] client role only: parameter A/B — no alternative parameter set
 #         beats the default's mean at any of the six anchor sizes (1 B,
 #         32 B, 256 B, 1 KB, 64 KB, 1 MB) by >= 1%. If one does, the
 #         hardware disagrees with the assumed 256/64 and the dev session
 #         re-tunes the defaults from these numbers.
-#   [6.9] client role only: the record — per-set anchor table and the
+#   [6.8] client role only: the record — per-set anchor table and the
 #         per-size mean/CV table of the default sweeps (the measured
 #         envelope for ADR-0006)
 #
@@ -74,17 +74,25 @@ report() { # report <check> <PASS|FAIL> [detail ...]
 # A sweep file is the client's raw stdout: 21 lines of size<TAB>value<TAB>unit.
 # ---------------------------------------------------------------------------
 
+# The Kbps/Mbps/Gbps -> Gbps conversion, shared by the awk helpers below:
+# prepend awk_gbps_func to an awk program; gbps($2 + 0, $3) returns the
+# sweep line's value in Gbps.
+awk_gbps_func='function gbps(v, u, m) {
+    m = 1;
+    if (u == "Kbps") m = 1000;
+    else if (u == "Mbps") m = 1000000;
+    else if (u == "Gbps") m = 1000000000;
+    return v * m / 1000000000 }'
+
 # cv_at <line> <file...>: mean and coefficient of variation (%, sample sd)
 # of the <line>-th value across the files: prints "mean cv".
 cv_at() {
     local line="$1"
     shift
-    awk -v line="$line" '
-        FNR == line { m = 1;
-            if ($3 == "Kbps") m = 1000;
-            else if ($3 == "Mbps") m = 1000000;
-            else if ($3 == "Gbps") m = 1000000000;
-            v[++n] = ($2 + 0) * m / 1000000000 }
+    # The function snippet and the rules must be ONE awk argument (a second
+    # argument would be read as a filename), hence the adjacent strings.
+    awk -v line="$line" "$awk_gbps_func"'
+        FNR == line { v[++n] = gbps($2 + 0, $3) }
         END {
             for (i = 1; i <= n; i++) { s += v[i]; s2 += v[i] * v[i] }
             mean = (n > 0) ? s / n : 0
@@ -114,12 +122,8 @@ contract_detail() {
 # message-rate-bound regime throughput doubles with size (same msg rate,
 # double the bytes), measured to within <1% on the dev pair (ADR-0005).
 scaling_1to32() {
-    awk '
-        FNR <= 6 { m = 1;
-            if ($3 == "Kbps") m = 1000;
-            else if ($3 == "Mbps") m = 1000000;
-            else if ($3 == "Gbps") m = 1000000000;
-            v[FNR] = ($2 + 0) * m / 1000000000 }
+    awk "$awk_gbps_func"'
+        FNR <= 6 { v[FNR] = gbps($2 + 0, $3) }
         FNR == 6 {
             for (i = 1; i < 6; i++) {
                 r = v[i + 1] / v[i]
@@ -129,6 +133,12 @@ scaling_1to32() {
                 }
             }
             print "ok" }' "$1"
+}
+
+# sweep_valid <rcfile> <outfile>: the sweep exited 0 and produced a clean
+# 21-line contract — the gate every analysis below applies.
+sweep_valid() {
+    [ "$(cat "$1")" -eq 0 ] && [ "$(contract_detail "$2")" = ok ]
 }
 
 # ---------------------------------------------------------------------------
@@ -191,7 +201,7 @@ else
     report "server executable, client symlink to server" FAIL
 fi
 
-# --- [6.3] Graceful failure when no server listens (client role only) -------
+# --- [6.2] Graceful failure when no server listens (client role only) -------
 
 if [ "$role" = client ]; then
     out=$(timeout 10 ./client 127.0.0.1 2>&1)
@@ -207,7 +217,7 @@ if [ "$role" = client ]; then
     fi
 fi
 
-# --- [6.4] The 9-sweep campaign (both roles) --------------------------------
+# --- [6.3] The 9-sweep campaign (both roles) --------------------------------
 #
 # Server side: one `./server` instance per sweep, in order. Each instance
 # exits 0 only after all 21 dones and the teardown beat, printing nothing.
@@ -249,6 +259,10 @@ else
             fi
             rc=$?
             [ "$rc" -eq 0 ] && break
+            # A QP error prints to stderr and must fail this sweep (the
+            # [6.2]/[6.3] contract), not be retried; only silent failures —
+            # the server instance not up yet — are retried.
+            [ -s "$err" ] && break
             sleep 2
         done
         echo "$rc" >"$rcfile"
@@ -271,8 +285,7 @@ else
     valid_alts=("" "" "")   # one entry per alternative set
     for i in $(seq 1 $NSWEEPS); do
         set=${SETS[$((i - 1))]}
-        rc=$(cat "$dir/sweep.$i.rc")
-        if [ "$rc" -eq 0 ] && [ "$(contract_detail "$dir/sweep.$i.out")" = ok ]; then
+        if sweep_valid "$dir/sweep.$i.rc" "$dir/sweep.$i.out"; then
             case "$set" in
                 256:64) valid_defaults+=("$dir/sweep.$i.out") ;;
                 512:64)  valid_alts[0]+="$dir/sweep.$i.out " ;;
@@ -299,12 +312,12 @@ else
                "only $ndef valid — rerun the campaign (see per-sweep failures above)"
     fi
 
-    # --- [6.5] Variance at the large sizes across the default sweeps -------
+    # --- [6.4] Variance at the large sizes across the default sweeps -------
 
     if [ "$ndef" -ge 3 ]; then
-        for anchor in "17:64 KB" "21:1 MB"; do
-            line=${anchor%%:*}
-            label=${anchor#*:}
+        for ai in 4 5; do
+            line=${ANCHOR_LINES[$ai]}
+            label=${ANCHOR_LABELS[$ai]}
             set -- $(cv_at "$line" "${valid_defaults[@]}")
             mean=$1; cv=$2
             if awk -v cv="$cv" 'BEGIN { exit (cv >= 1) }'; then
@@ -320,12 +333,11 @@ else
         report "variance < 1% at 1 MB (n>=3)" FAIL "no statistics — see above"
     fi
 
-    # --- [6.6] Message-rate-bound scaling, every sweep ----------------------
+    # --- [6.5] Message-rate-bound scaling, every sweep ----------------------
 
     for i in $(seq 1 $NSWEEPS); do
         set=${SETS[$((i - 1))]}
-        rc=$(cat "$dir/sweep.$i.rc")
-        if [ "$rc" -eq 0 ] && [ "$(contract_detail "$dir/sweep.$i.out")" = ok ]; then
+        if sweep_valid "$dir/sweep.$i.rc" "$dir/sweep.$i.out"; then
             d=$(scaling_1to32 "$dir/sweep.$i.out")
             if [ "$d" = ok ]; then
                 report "sweep $i (W=${set%:*}, K=${set#*:}): 1..32 B doubles throughput" PASS
@@ -335,11 +347,11 @@ else
             fi
         else
             report "sweep $i (W=${set%:*}, K=${set#*:}): 1..32 B doubles throughput" FAIL \
-                   "sweep invalid — see [6.4]"
+                   "sweep invalid — see [6.3]"
         fi
     done
 
-    # --- [6.7] Default envelope holds the measured floors -------------------
+    # --- [6.6] Default envelope holds the measured floors -------------------
 
     if [ "$ndef" -ge 3 ]; then
         set -- $(cv_at 1 "${valid_defaults[@]}")
@@ -353,11 +365,8 @@ else
         set -- $(cv_at 21 "${valid_defaults[@]}")
         last=$1
         max=$(for f in "${valid_defaults[@]}"; do
-                  awk '{ m = 1; if ($3 == "Kbps") m = 1000;
-                         else if ($3 == "Mbps") m = 1000000;
-                         else if ($3 == "Gbps") m = 1000000000;
-                         if (($2 + 0) * m / 1000000000 > max)
-                             max = ($2 + 0) * m / 1000000000 }
+                  awk "$awk_gbps_func"'
+                      { if (gbps($2 + 0, $3) > max) max = gbps($2 + 0, $3) }
                       END { print max + 0 }' "$f"
               done | sort -n | tail -1)
 
@@ -381,12 +390,16 @@ else
                "no statistics — see above"
     fi
 
-    # --- [6.8] Parameter A/B: does the hardware agree with 256/64? ----------
+    # --- [6.7] Parameter A/B: does the hardware agree with 256/64? ----------
 
     if [ "$ndef" -ge 3 ]; then
         alt_beats=""
+        untested=""
         for j in 0 1 2; do
-            [ "${n_alt[$j]}" -lt 2 ] && continue
+            if [ "${n_alt[$j]}" -lt 2 ]; then
+                untested="$untested ${alt_labels[$j]}(only ${n_alt[$j]} valid)"
+                continue
+            fi
             for ai in "${!ANCHOR_LINES[@]}"; do
                 line=${ANCHOR_LINES[$ai]}
                 label=${ANCHOR_LABELS[$ai]}
@@ -399,7 +412,10 @@ else
                 fi
             done
         done
-        if [ -z "$alt_beats" ]; then
+        if [ -n "$untested" ]; then
+            report "no alternative beats default (W=256, K=64) by >= 1%" FAIL \
+                   "not fully tested:$untested — rerun the campaign"
+        elif [ -z "$alt_beats" ]; then
             report "no alternative beats default (W=256, K=64) by >= 1%" PASS \
                    "defaults confirmed on this pair"
         else
@@ -411,7 +427,7 @@ else
                "no statistics — see above"
     fi
 
-    # --- [6.9] The record: anchor table and per-size envelope ----------------
+    # --- [6.8] The record: anchor table and per-size envelope ----------------
 
     if [ "$ndef" -ge 3 ]; then
         printf '             --- anchor table (Gbps means) ---\n'

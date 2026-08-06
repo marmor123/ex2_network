@@ -1,4 +1,4 @@
-# T6 dev-pair campaign: variance, scaling, and the window/signal A/B (ADR-0006)
+# T6 dev-pair campaign: variance, scaling, and the window/signal A/B
 
 The T6 measurement campaign (issue #7, stage 6 of verify.sh) ran on the dev pair (mlxstud01/02) in the same conditions as ADR-0004/0005: 9 full sweeps — 3 with the default parameters (W=256, K=64) and 2 each of the alternatives (512,64), (256,128), (512,128) — with per-sweep contract checks on both roles. Report: 26/26 client-side, 11/11 server-side, no QP errors.
 
