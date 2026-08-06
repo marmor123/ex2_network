@@ -112,6 +112,45 @@ Anomaly-3 (pair gap) support for the viva. 2 minutes.
 
 ---
 
+## Module A — results (final pair, 2026-08-06)
+
+All 8 runs completed. Findings:
+
+1. **The 1 MB dip is warmup arithmetic at every count.** 1 MB reads 40.57
+   (n=80, model 40.54), 42.43 (n=640, model 42.31, +0.28%), 42.63 (n=2560,
+   model 42.51, +0.28%), 42.54 (n=5120, model 42.53), 42.55 (n=10240, model
+   42.54) — and 40.57 at the default count. The dip follows the count, not the
+   size: R·n/(n+4) confirmed on the final pair at five counts.
+2. **The 2 KB excess is count-INDEPENDENT on the final pair — ticket 18's
+   count-dependence was a dev-pair phenomenon.** Per-message time at 2 KB =
+   wire (385 ns) + ack/n + **~112 ns**, at every count tested (80, 640, 2560,
+   5120, 10240, 20480): 620/512/500/504/503/502 ns. The ticket-13 per-message
+   floor (~490–500 ns total) is **reinstated for the final pair**; the
+   count-dependence seen on the dev pair (60 ns excess @ 20480 only, ~0 @
+   640/80) does not reproduce here. Consequence: reducing the 2 KB count does
+   not help on the final pair (32.67 @ 20480 vs 32.74 @ 2560 — 0.2%). The
+   count-reduction option is dead; the size boundary is now the question
+   (module B3).
+3. **Model residuals are ≤ 0.3%** (systematic +0.2–0.3% at low counts / large
+   sizes, count-correlated, unmodeled; below decision threshold). Flat R =
+   42.56–42.57 today — pair stable vs ADR-0007. The final pair's control
+   round trip looks ~5–7 µs, not ADR-0003's ~10 µs (dev-pair number) — viva
+   footnote.
+
+**Updated B1/B2/B3 predictions** (final pair):
+- B1 `-w 0`: 1 MB → ~42.5–42.6, flat with the DMA envelope (the dip vanishes).
+  2 KB unchanged (~32.7 — the excess is count- and warmup-independent).
+- B2 `-w 256`: unchanged — the collapse ~10.1 Gbps vs ticket-18's ~42.5.
+- B3 intermediate sizes (the 2 KB excess's shape): the three candidate models
+  for per-message time at τ = size/42.57:
+  - *additive excess 112 ns, shutting off above τ ≈ 550 ns*: 1536 → 30.6,
+    2560 → 33.1, 3072/3584 → ~42.6
+  - *floor: max(τ, 496 ns)*: 1536 → 24.8, 2560 → 41.3, 3072/3584 → ~42.6
+  - *no excess below 2 KB*: 1536 → 42.6
+  The 2560 B point (33.1 vs 41.3) is the sharpest discriminator.
+
+---
+
 ## Decision & apply (after the data)
 
 1. **Warmup**: apply warmup = 0 (or 0 only where the penalty ≥ 1%: sizes ≥ 128 KB)
@@ -120,10 +159,10 @@ Anomaly-3 (pair gap) support for the viva. 2 minutes.
    Trade-off recorded in ticket 18: the counts table is "ex1 verbatim"
    (ADR-0003's methodology continuity) — changing warmup trades ex1
    comparability for honest numbers. User decision at resolution.
-2. **2 KB count**: if module A/B maps a clean count threshold, either set
-   20480 → 2560 (reports the short-stream rate) or keep the ex1 table and
-   document the anomaly as a measurement property of long 2 KB streams. Same
-   ex1-verbatim trade-off.
+2. **2 KB**: the count-reduction option is **dead on the final pair** — the
+   excess is count-independent (~112 ns per message at every count tested).
+   The open question is the excess's size boundary (module B3) and mechanism;
+   the ex1 counts table stays verbatim unless B3 reveals a count-sized fix.
 3. **W/K**: keep 256/64 unless B4 says otherwise.
 4. Apply on a branch, re-run verify.sh on the final pair, record the new
    envelope (this becomes the app chart's data — ticket 16's envelope chapter
