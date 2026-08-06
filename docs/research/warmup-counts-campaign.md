@@ -151,19 +151,63 @@ All 8 runs completed. Findings:
 
 ---
 
+## Module B — results (final pair, 2026-08-06)
+
+All 11 runs completed. Findings:
+
+1. **B1 (`-w 0`) — the measurement fix works: the dip is gone.** 1 MB reads
+   **42.63** (42.67/42.54/42.68, CV ≈ 0.2%) vs 40.57 at the default warmup —
+   **+2.06 Gbps (+5.1%)** — and now sits flat with the DMA envelope (64 KB
+   42.59, 128 KB 42.59). The small sizes are untouched (1 B 48.98 vs 48.97,
+   1 KB 6.55 identical). Every other size reads the warmup-arithmetic value
+   exactly (e.g. 128 KB @ count 320, warmup 0 → 42.59 vs model 42.57·320/320).
+2. **B2 (`-w 256`) — ticket 18's recovery claim is FALSIFIED, precisely.**
+   1 MB reads **10.15** (×3) vs the window-arithmetic prediction R·80/336 =
+   10.14 — a 4.2× gap from the claim's ~42.5. The whole envelope follows
+   R·n/(n+256) within 0.4%: 64 KB 30.44 (model 30.41), 128 KB 23.68 (23.65),
+   256 KB 16.40 (16.37), 512 KB 16.39 (16.37), 8–32 KB 38.7 (38.70). A larger
+   warmup *adds* to the measured window; it cannot hide inside it. The only
+   warmup that recovers the dip is 0.
+3. **B3 — the 1.5–4 KB excess is real, per-message, and NON-monotone in
+   size.** Per-message excess over wire (count 20480, warmup 0/4, reproducible
+   across B1/B3/B4 runs, 8 measurements each point): 1536 B **+73 ns**, 2048 B
+   **+117 ns**, 2560 B **+50 ns**, 3072 B **+25 ns**, 3584 B **+60 ns**,
+   4096 B **≈ +4 ns**. Neither the additive-112 ns model (predicted 1536 →
+   30.6, 2560 → 33.1) nor the 496 ns floor (predicted 1536 → 24.8, 2560 →
+   41.3) fits — measured 33.95 / 38.53. The 3584 B re-rise (+60 ns vs 3072's
+   +25) is rock-solid across all runs. Mechanism not isolated: HCA-internal
+   (WQE/payload-fetch pipeline), count-independent at 2 KB (module A), value
+   pair-dependent (dev pair: +60 ns @ 20480 only, ~0 @ 640/80). No user-side
+   parameter touches it. **The 2 KB ramp stands as a documented measurement
+   property, not a fixable defect.**
+4. **B4 — W/K under warmup=0: no set beats (256,64).** 1 MB: 42.63 (256/64)
+   vs 42.54 (512/64), 42.67 (256/128), 42.54 (512/128) — 0.3% spread, below
+   the 1% gate; other lines match B1 within noise. ADR-0007's A/B verdict
+   holds under the new counts.
+
+**Secondary:** B1's flat region reads 42.59–42.63 vs the 5120/10240-count
+runs' 42.53–42.55 — a count-correlated ±0.2–0.3% residual (low counts run
+slightly hot), present in every run, below decision threshold; viva footnote.
+The 4 KB point sits ~0.4% below its model in every run (42.36–42.39 vs 42.53)
+— same class of residual.
+
 ## Decision & apply (after the data)
 
-1. **Warmup**: apply warmup = 0 (or 0 only where the penalty ≥ 1%: sizes ≥ 128 KB)
-   if B1 confirms ~42.5 at 1 MB — a measurement fix; the viva story is "the audit
-   found the ex1-inherited warmup's wire time inside the measured window".
-   Trade-off recorded in ticket 18: the counts table is "ex1 verbatim"
-   (ADR-0003's methodology continuity) — changing warmup trades ex1
-   comparability for honest numbers. User decision at resolution.
-2. **2 KB**: the count-reduction option is **dead on the final pair** — the
-   excess is count-independent (~112 ns per message at every count tested).
-   The open question is the excess's size boundary (module B3) and mechanism;
-   the ex1 counts table stays verbatim unless B3 reveals a count-sized fix.
-3. **W/K**: keep 256/64 unless B4 says otherwise.
-4. Apply on a branch, re-run verify.sh on the final pair, record the new
-   envelope (this becomes the app chart's data — ticket 16's envelope chapter
-   needs the update), update the ADRs (0007's numbers) if the record changes.
+1. **Warmup = 0 — applied** (user-approved 2026-08-06): the warmup table goes
+   to zero at every size. B1 measured the change directly on hardware: 1 MB
+   +2.06 Gbps to 42.63, flat with the envelope; small sizes unchanged (the
+   1 B line is 48.98 both ways); CV ≈ 0.2%. The viva story: "the audit found
+   the ex1-inherited warmup's wire time inside the measured window — warmup=0
+   reports the true flat rate; the timed counts remain ex1's, verbatim".
+   Trade-off acknowledged: ADR-0003's ex1-identical methodology is superseded
+   for the warmup batch only.
+2. **2 KB / 1.5–4 KB excess: no fix — documented.** Count-reduction is dead
+   (count-independent), the mechanism is HCA-internal, and the profile is
+   non-monotone (module B3). The envelope keeps the 2 KB ramp; the record in
+   dma-regime-shape.md is updated (final pair: count-independent ~112 ns
+   per-message excess, reinstated floor; dev pair: the ticket-18
+   count-dependence stands — the two pairs differ).
+3. **W/K: 256/64 stays** (B4: 0.3% spread at warmup=0).
+4. **Re-measurement**: verify.sh on the final pair with the applied build —
+   the 9-sweep record becomes the new envelope (ADR-0007 numbers superseded;
+   the app's envelope chapter chart, ticket 16, needs the update).
