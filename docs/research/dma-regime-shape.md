@@ -148,6 +148,20 @@ is fitted from two points (one per pair). The intermediate-size prediction — 1
 should sit at ~500 ns/message (~24.5 Gbps), 3 KB at ~565 ns/message (~41.9 Gbps) —
 is the falsifiable test.
 
+**Update (2026-08-06, ticket 18 probes, dev pair) — count-independence falsified.**
+The bonus prediction "2 KB stays ~32.7, the floor is count-independent" failed: with
+`-n 640` (640 timed + 4 warmup) the 2 KB point reads **36.44 Gbps** — on the
+wire+ack model (predicted 36.71, −0.7%) — and with `-n 80` it reads **29.23 Gbps**
+(also on the wire+ack curve: predicted 28.52). Only the default count 20480 carries
+the excess: 60.5 ns/message over wire (33.53). Per-message excess over wire time:
+~61 ns @ 20480, ~19 ns @ 640 (≈ the ack RTT share, ~15.5 ns — i.e. none), ~0 @ 80.
+The excess is therefore a **long-stream effect, not a per-message floor**: it appears
+only at count 20480. (T4 = T5 = T6 at 2 KB all ran the default 20480 count — the
+"T4 naive path also shows it" evidence is consistent with this: the common factor
+was the count, not the post loop.) The intermediate-size probe (1536/2560/3072/
+3584 B) is now a measurement-campaign item (issue #19), and the floor's replacement
+mechanism (CQE/refill interaction, PCIe read depth at stream length) is open.
+
 ## Anomaly 3 — 38 Gbps (dev pair) vs 42.5 Gbps (final pair): the host interface
 
 **Mechanism.** The DMA flat rate R is the HCA's effective payload-read bandwidth from
