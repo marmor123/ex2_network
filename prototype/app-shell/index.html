@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE — throwaway by design (branch: prototype/app-shell).
+
+  Question: what should the teaching app look and feel like — visual language,
+  navigation, diagram style, code presentation, interactivity level?
+
+  Plan: three structurally-different variants of the shell, switchable via
+  ?variant=A|B|C from a floating bottom bar (arrow keys too):
+    A — Field notes  : code-first, dark, annotated-source scroll
+    B — System map   : diagram-first, light, living pipeline, tabbed layers
+    C — Viva deck    : presentation, slide decks, question-reveal viva mode
+  Content (js/content.js) and the envelope chart (js/chart.js) are shared.
+  Runs from file:// — no server, no build step: open this file.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — bw.c follow the data</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script src="js/content.js"></script>
+  <script src="js/chart.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
