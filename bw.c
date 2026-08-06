@@ -102,27 +102,42 @@
 
 /* The number of control exchanges per direction: one done/ack pair per
  * size of the sweep (2^0..2^20), which also proves the 32-deep control
- * receive pool covers a full sweep. */
-#define SWEEP_SIZES 21
+ * receive pool covers a full sweep. Scratch-build extension: four
+ * intermediate DMA sizes appended after 1 MB (measurement campaign #19),
+ * still within the 32-deep pool. */
+#define SWEEP_SIZES 25
+
+/* The sweep's message sizes, indexed by seq 0..SWEEP_SIZES-1: the ex1
+ * powers of two plus the campaign's four intermediate DMA sizes. The
+ * first 21 entries keep the ex1 contract layout (line N = size 2^(N-1)). */
+static const size_t SWEEP_SIZE_TABLE[SWEEP_SIZES] = {
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
+        2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+        1048576,                        /* ... 1MB */
+        1536, 2560, 3072, 3584          /* campaign: intermediate DMA sizes */
+};
 
 /* The ex1 converged counts table, verbatim: one entry per size of the
  * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
  * (throughput variance < 1% between doubled counts); WARMUP_COUNTS from
- * ex1's warmup probe. */
+ * ex1's warmup probe. The intermediate sizes take 2 KB's count (20480)
+ * and the standard warmup of 4. */
 static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         1310720, 81920, 655360, 163840, 327680, /* 1B 2B 4B 8B 16B */
         20480, 81920, 81920, 40960, 20480,      /* 32B 64B 128B 256B 512B */
         20480, 20480, 20480, 2560, 2560,        /* 1KB 2KB 4KB 8KB 16KB */
         2560, 640, 320, 160, 160,               /* 32KB 64KB 128KB 256KB 512KB */
-        80                                       /* 1MB */
+        80,                                      /* 1MB */
+        20480, 20480, 20480, 20480              /* campaign: 1536 2560 3072 3584 B */
 };
 
 static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
-        16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
+        16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4
 };
 
-/* The sweep loop (bw_client_bench) indexes both tables by seq 0..20; an
- * under-long initializer would compile silently and read zeros (a size
+/* The sweep loop (bw_client_bench) indexes the tables by seq 0..SWEEP_SIZES-1;
+ * an under-long initializer would compile silently and read zeros (a size
  * with no timed WRs). Same compile-time idiom as bw_ctrl_msg_size. */
 typedef char bw_counts_size_ok[(sizeof MSG_COUNTS / sizeof MSG_COUNTS[0] ==
                                 SWEEP_SIZES) ? 1 : -1];
@@ -983,9 +998,13 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
  * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
  * passes the data and done-send completions through; the 21 acks consume
  * 21 of the 32 pre-posted control receive pool, never refreshed.
- * count_override (-n) replaces the timed count of every size. */
+ * count_override (-n) replaces the timed count of every size;
+ * warmup_override (-w, warmup_set) replaces the warmup count of every
+ * size — 0 is a legal override, so the set flag disambiguates it from
+ * "not given". */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
-                           uint64_t window, uint64_t k, uint64_t count_override)
+                           uint64_t window, uint64_t k, uint64_t count_override,
+                           uint64_t warmup_override, int warmup_set)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
     struct ibv_send_wr *wrs;
@@ -1001,14 +1020,15 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
     }
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
-        size_t size = (size_t) 1 << seq;
+        size_t size = SWEEP_SIZE_TABLE[seq];
         uint64_t count = count_override ? count_override : MSG_COUNTS[seq];
+        uint64_t warmup = warmup_set ? warmup_override : WARMUP_COUNTS[seq];
         struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
         struct bw_data_state st = { 0, 0 };
 
-        if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq],
+        if (bw_post_writes(ctx, dest, size, warmup,
                            window, k, wrs, sges, &st, 0))
             goto out;
 
@@ -1138,6 +1158,8 @@ static void usage(const char *argv0)
     printf("                      max min(window, %d))\n", QP_SLACK);
     printf("  -n, --count=<n>      override the timed-batch count of every size\n");
     printf("                      (smoke-test the protocol with tiny batches)\n");
+    printf("  -w, --warmup=<n>     override the warmup-batch count of every size\n");
+    printf("                      (0 = no warmup; unset = the ex1 table)\n");
     printf("  -g, --gid-idx=<index>  local port gid index (default: LID-based)\n");
 }
 
@@ -1155,6 +1177,8 @@ int main(int argc, char *argv[])
     int                      window = WINDOW_DEFAULT;
     int                      k = SIGNAL_INTERVAL_DEFAULT;
     uint64_t                 count_override = 0;
+    uint64_t                 warmup_override = 0;
+    int                      warmup_set = 0;
     int                      gidx = -1;
 
     srand48(getpid() * time(NULL));
@@ -1169,11 +1193,12 @@ int main(int argc, char *argv[])
                 { .name = "window",   .has_arg = 1, .val = 'r' },
                 { .name = "signal-interval", .has_arg = 1, .val = 'k' },
                 { .name = "count",    .has_arg = 1, .val = 'n' },
+                { .name = "warmup",   .has_arg = 1, .val = 'w' },
                 { .name = "gid-idx",  .has_arg = 1, .val = 'g' },
                 { 0 }
         };
 
-        c = getopt_long(argc, argv, "p:d:i:r:k:n:g:", long_options, NULL);
+        c = getopt_long(argc, argv, "p:d:i:r:k:n:w:g:", long_options, NULL);
         if (c == -1)
             break;
 
@@ -1234,6 +1259,20 @@ int main(int argc, char *argv[])
                 return 1;
             }
             count_override = v;
+            break;
+        }
+
+        case 'w': {
+            uint64_t v;
+
+            /* 0 is legal here (no warmup) — unlike -n, whose 0 would mean
+             * an empty timed batch. */
+            if (!bw_parse_u64(optarg, &v) || v > INT_MAX) {
+                usage(argv[0]);
+                return 1;
+            }
+            warmup_override = v;
+            warmup_set = 1;
             break;
         }
 
@@ -1365,14 +1404,14 @@ int main(int argc, char *argv[])
      * verify every sequence counter. */
     if (servername) {
         if (bw_client_bench(ctx, rem_dest, (uint64_t) window, (uint64_t) k,
-                            count_override))
+                            count_override, warmup_override, warmup_set))
             return 1;
     } else {
         if (bw_server_ctrl_exchange(ctx))
             return 1;
     }
 
-    /* All 21 sizes complete; the 21 result lines were printed. */
+    /* All SWEEP_SIZES sizes complete; the result lines were printed. */
     {
         int rc = bw_close_ctx(ctx);
 
