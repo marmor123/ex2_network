@@ -59,7 +59,7 @@ _Avoid_: sync, round-trip
 **Inline**:
 Sending a message's data inside the WQE at post time (`IBV_SEND_INLINE`) instead of DMA-reading it from a buffer; used for every message ≤ `max_inline_data`.
 _Avoid_: zero-copy, copy-less
-Measured on the course stack (ADR-0004): messages ≤ `max_inline_data` ride the inline path — a per-message payload copy at ~853 MB/s, capping ≤1 KB at ~6.4 Gbps — even without the flag; the DMA path above that size is host-interface-bound at ~38 Gbps.
+Measured on the course stack (ADR-0004): messages ≤ `max_inline_data` ride the inline path — a per-message payload copy at ~853 MB/s, capping ≤1 KB at ~6.4 Gbps — even without the flag; the DMA path above that size is host-interface-bound (~38 Gbps on the dev pair, ~42.5 Gbps on mlxstud03/04, ADR-0007).
 
 **max_inline_data**:
 The device-advertised inline limit, queried at runtime and declared at QP creation (mlx4 fails QP creation if the request exceeds it).
