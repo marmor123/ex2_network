@@ -73,6 +73,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -119,6 +120,14 @@ static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
 static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
         16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
 };
+
+/* The sweep loop (bw_client_bench) indexes both tables by seq 0..20; an
+ * under-long initializer would compile silently and read zeros (a size
+ * with no timed WRs). Same compile-time idiom as bw_ctrl_msg_size. */
+typedef char bw_counts_size_ok[(sizeof MSG_COUNTS / sizeof MSG_COUNTS[0] ==
+                                SWEEP_SIZES) ? 1 : -1];
+typedef char bw_warmup_size_ok[(sizeof WARMUP_COUNTS / sizeof WARMUP_COUNTS[0] ==
+                                SWEEP_SIZES) ? 1 : -1];
 
 /* Control messages: 8 bytes each — a fixed tag plus the sequence counter
  * (the size index 0..20). The ack carries the received done verbatim, so
@@ -842,9 +851,11 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
  * (warmup + timed) so the signal schedule can pick the K-th WRs;
  * outstanding is posted minus the WRs the refill has reclaimed — exactly
  * K per reclaimed CQE, because only K-th WRs are signaled and RC
- * completions are in-order; the warmup residual and the final list's
- * remainder are covered by the CQEs the ack wait consumes, never by the
- * refill. Scoped to one size: the ack wait consumes the remaining data
+ * completions are in-order; the warmup residual (warmup counts are below
+ * K, so the warmup itself yields no CQEs) is covered by the first
+ * multiple-of-K CQE, which the refill consumes; only the final list's
+ * remainder is covered by the CQEs the ack wait consumes. Scoped to one
+ * size: the ack wait consumes the remaining data
  * and done completions without touching the state, so it must not
  * survive into the next size. */
 struct bw_data_state {
@@ -1091,6 +1102,25 @@ static int bw_close_ctx(struct bw_context *ctx)
     return 0;
 }
 
+/* Strict unsigned option parsing: the whole string must parse as a
+ * number, so "-5" (which strtoull wraps), "abc" (which becomes 0) and
+ * "12x" (trailing garbage) all fail instead of silently starting a run
+ * with a nonsense value (audit finding 7). */
+static int bw_parse_u64(const char *s, uint64_t *out)
+{
+    char *end;
+    unsigned long long v;
+
+    if (!s || !*s || s[0] == '-')
+        return 0;
+    errno = 0;
+    v = strtoull(s, &end, 0);
+    if (errno == ERANGE || end == s || *end != '\0')
+        return 0;
+    *out = (uint64_t) v;
+    return 1;
+}
+
 static void usage(const char *argv0)
 {
     printf("Usage:\n");
@@ -1148,53 +1178,75 @@ int main(int argc, char *argv[])
             break;
 
         switch (c) {
-        case 'p':
-            port = strtol(optarg, NULL, 0);
-            if (port < 0 || port > 65535) {
+        case 'p': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v > 65535) {
                 usage(argv[0]);
                 return 1;
             }
+            port = (int) v;
             break;
+        }
 
         case 'd':
             ib_devname = strdup(optarg);
             break;
 
-        case 'i':
-            ib_port = strtol(optarg, NULL, 0);
-            if (ib_port < 0) {
+        case 'i': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v > INT_MAX) {
                 usage(argv[0]);
                 return 1;
             }
+            ib_port = (int) v;
             break;
+        }
 
-        case 'r':
-            window = strtol(optarg, NULL, 0);
-            if (window <= 0) {
+        case 'r': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v == 0 || v > INT_MAX) {
                 usage(argv[0]);
                 return 1;
             }
+            window = (int) v;
             break;
+        }
 
-        case 'k':
-            k = strtol(optarg, NULL, 0);
-            if (k < 1) {
+        case 'k': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v == 0 || v > INT_MAX) {
                 usage(argv[0]);
                 return 1;
             }
+            k = (int) v;
             break;
+        }
 
-        case 'n':
-            count_override = strtoull(optarg, NULL, 0);
-            if (count_override < 1) {
+        case 'n': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v == 0) {
                 usage(argv[0]);
                 return 1;
             }
+            count_override = v;
             break;
+        }
 
-        case 'g':
-            gidx = strtol(optarg, NULL, 0);
+        case 'g': {
+            uint64_t v;
+
+            if (!bw_parse_u64(optarg, &v) || v > INT_MAX) {
+                usage(argv[0]);
+                return 1;
+            }
+            gidx = (int) v;
             break;
+        }
 
         default:
             usage(argv[0]);
@@ -1246,6 +1298,17 @@ int main(int argc, char *argv[])
     ctx = bw_init_ctx(ib_dev, ib_port, window, !servername);
     if (!ctx)
         return 1;
+
+    /* The refill's second loop condition (bw_refill) is permanently true
+     * when the SQ was created shallower than K — a device clamping
+     * max_qp_wr below K would make the first refill spin on an empty CQ
+     * with no deadline (audit finding 6; unreachable on the course HCAs,
+     * which report max_qp_wr >= 1536). Refuse instead of spinning. */
+    if ((uint64_t) k >= (uint64_t) ctx->sq_depth) {
+        fprintf(stderr, "QP depth %u too small for signal interval %d\n",
+                ctx->sq_depth, k);
+        return 1;
+    }
 
     /* The whole control receive pool is posted before the handshake, so no
      * control message can ever find the RQ empty (ADR-0001). */
