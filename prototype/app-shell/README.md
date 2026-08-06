@@ -29,17 +29,25 @@ or the arrow keys (`?variant=A|B|C` in the URL; reload-stable):
 | **D** | Studio | Split-screen, Claude-like (cream, white panels, terracotta). Left: code on top, explanation below. Right: a hand-drawn-style SVG diagram synced to the frame — struct design (linked lists, pointers), the connection, the live traffic — with leader-line annotations and a facts strip under every figure. One idea per frame; dotted progress + corner arrows at the bottom. | Step through the frames with the corner arrows; the diagram tracks the code |
 
 Content is shared: home (experiment, roles, envelope chart, spine) and the
-stops built so far — the **Setup** group (**The experiment**, ADR-0003 clock
-window; **The handshake**, ADR-0001 TCP exchange + control receive pool;
-**Memory region**, ADR-0002 registration + declare-then-read-back) and the
-full **Data path** group (**Posting the window**, **The doorbell**, **On the
-wire**, **Landing in server memory**, **Completions**) — each with concept /
-annotated code / ADR why / viva what-ifs, using CONTEXT.md vocabulary. The
-data-path chapters carry the research findings: the HCA's ~853 MB/s inline
-copy (research #12, wire stop), the 2 KB per-message DMA floor (research #13,
-wire stop), the completion-slaved ~163 ns ceiling (research #11, completions
-stop). Stops are added per the wayfinder build tickets (#14: setup chapters,
-#15: data path, #16: envelope/choices/audit).
+stops — the **Setup** group (**The experiment**, ADR-0003 clock window;
+**The handshake**, ADR-0001 TCP exchange + control receive pool;
+**Memory region**, ADR-0002 registration + declare-then-read-back), the full
+**Data path** group (**Posting the window**, **The doorbell**, **On the
+wire**, **Landing in server memory**, **Completions**, **The control round
+trip**), and the closing groups: **The envelope** (**The shape of the
+numbers** — three regimes, the 1 MB dip's warmup arithmetic, the 2 KB DMA
+floor, the pair gap, all five anomalies), **The choices** (**Why it's
+written like this** — each ADR with its rejected alternative), **Inside the
+audit** (**What the audit found** — twelve verdicts, the one wrong comment,
+the hardenings), and **The harness** (**The program's shell** — argc role
+dispatch, the seven flags, the bounds, device pick, teardown). Every stop
+carries concept / annotated code / ADR why / viva what-ifs, using CONTEXT.md
+vocabulary; the data-path and envelope chapters carry the research findings:
+the HCA's ~853 MB/s inline copy (research #12), the 2 KB per-message DMA
+floor (research #13), the completion-slaved ~163 ns ceiling (research #11),
+and the warmup-in-window arithmetic (research #13). Full bw.c coverage: all
+18 functions are annotated somewhere. Stops are added per the wayfinder
+build tickets (#14: setup chapters, #15: data path, #16: closing chapters).
 
 The envelope chart follows the dataviz skill (single-series line on log2
 sizes, crosshair + tooltip, table twin, light/dark tokens).

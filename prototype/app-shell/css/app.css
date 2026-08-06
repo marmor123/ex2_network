@@ -699,6 +699,9 @@
 .dk-flag { fill: var(--series-1); }
 .dk-warmup { fill: var(--surface-2); stroke: rgba(41, 38, 31, 0.10); stroke-width: 1; }
 .dk-timed { fill: var(--accent-bg); stroke: var(--series-1); stroke-width: 1.4; }
+.dk-zone-inline { fill: var(--accent-bg); stroke: var(--series-1); stroke-width: 1.2; opacity: 0.55; }
+.dk-zone-ramp { fill: var(--surface-2); stroke: rgba(41, 38, 31, 0.14); stroke-width: 1.2; }
+.dk-zone-flat { fill: var(--page); stroke: rgba(41, 38, 31, 0.14); stroke-width: 1.2; }
 .dk-clock { fill: #fff; stroke: var(--baseline); stroke-width: 1.4; }
 .dk-clock-hand { stroke: var(--ink-2); stroke-width: 1.6; }
 .dk-code { fill: var(--code-bg); stroke: rgba(41, 38, 31, 0.12); stroke-width: 1.2; }

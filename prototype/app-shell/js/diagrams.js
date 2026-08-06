@@ -1342,5 +1342,655 @@
         ["<b>163.3 ns</b> per message, 1–32 B flat", "(W,K) A/B: within <b>0.07%</b> — no parameter moves it",
          "one CQE poll per 256 messages — the completion path is nearly free"]);
     },
+
+    "ctrl-send-wqe"() {
+      const g = [];
+      g.push(node(28, 110, 270, 150, "THE SEND WQE — 8-byte message", [
+        "wr_id: DONE or ACK (routing)",
+        "opcode: IBV_WR_SEND",
+        "flags: SIGNALED + INLINE",
+        { title: "payload", sub: "tag · seq — inside the WQE" },
+      ]));
+      g.push(node(352, 110, 260, 150, "STAGED FALLBACK — inline off", [
+        "memcpy msg into ctrl_buf",
+        "SGE → ctrl_buf · lkey = ctrl_mr",
+        { title: "payload", sub: "DMA-read from the control area" },
+      ]));
+      g.push(text(320, 64, "max_inline_data ≥ 8?", { size: 13, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(curve(298, 150, 352, 150, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", bend: 0, label: "yes → inline", labelDy: -14 }));
+      g.push(curve(298, 190, 352, 190, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", bend: 0, label: "no → staged", labelDy: -14 }));
+      g.push(callout(60, 280, 300, { title: "Always signaled, unconditionally", sub: "the sender must see a completion for every control SEND" }));
+      g.push(text(470, 280, "the HCA transmits the WQE's own bytes — nothing to fetch", { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 330, g);
+      return fig("The control SEND — inline by default, staged as fallback (bw.c:733–741)", svg,
+        ["8 B ≤ max_inline_data = <b>1024</b> — inline in practice", "lkey = 0 is safe: the provider copies the data at post time",
+         "the fallback keeps the control path alive on any stack"]);
+    },
+
+    "recv-verify"() {
+      const g = [];
+      g.push(node(24, 70, 190, 140, "THE CQ", [
+        "data CQEs · done-send CQE",
+        "then the ACK receive CQE",
+      ]));
+      g.push(node(238, 70, 180, 140, "bw_poll_until", [
+        "want: BW_RECV_WRID",
+        "pass: data | done-send",
+        "deadline: 10 s",
+      ]));
+      g.push(node(442, 70, 174, 140, "t1 + verify", [
+        "stamp CLOCK_MONOTONIC",
+        "tag == BW_CTRL_TAG?",
+        "seq == this size?",
+      ]));
+      g.push(arrow(214, 120, 238, 120, { cls: "dk-arrow-data", marker: "dk-a-data" }));
+      g.push(arrow(418, 120, 442, 120, { cls: "dk-arrow-data", marker: "dk-a-data" }));
+      g.push(el("circle", { cx: 529, cy: 254, r: 11, class: "dk-clock" }));
+      g.push(el("line", { x1: 529, y1: 254, x2: 529, y2: 245, class: "dk-clock-hand" }));
+      g.push(el("line", { x1: 529, y1: 254, x2: 534, y2: 254, class: "dk-clock-hand" }));
+      g.push(text(529, 282, "t1 — the clock stops here", { size: 10, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(callout(24, 270, 320, { title: "A mismatch is an abort", sub: "wrong tag or wrong seq → 'mismatch' on stderr — never a corrupt number" }));
+
+      const svg = canvas(640, 310, g);
+      return fig("The ack wait, step by step (bw.c:817–838)", svg,
+        ["the pass set makes one shared CQ work", "t1 is stamped BEFORE verification — arrival time is arrival time",
+         "deadline: 10 s, then 'Timed out waiting for wr_id' (bw.c:775–809)"]);
+    },
+
+    "rt-cq"() {
+      const g = [];
+      const y = 160;
+      g.push(el("line", { x1: 30, y1: y, x2: 610, y2: y, class: "dk-axis" }));
+      [40, 116, 192].forEach((x) => {
+        g.push(rect(x, y - 22, 66, 44, { cls: "dk-warmup" }));
+        g.push(text(x + 33, y + 4, "data", { size: 10.5, weight: 600, anchor: "middle" }));
+      });
+      g.push(rect(268, y - 22, 84, 44, { cls: "dk-warmup" }));
+      g.push(text(310, y + 4, "done-send", { size: 10.5, weight: 600, anchor: "middle" }));
+      g.push(rect(366, y - 26, 84, 52, { cls: "dk-timed" }));
+      g.push(text(408, y + 4, "ACK", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(spanBracket(40, 352, y - 52, "pass — consumed and ignored"));
+      g.push(text(408, 96, "want — the wait stops here", { size: 10, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(el("circle", { cx: 408, cy: 240, r: 11, class: "dk-clock" }));
+      g.push(el("line", { x1: 408, y1: 240, x2: 408, y2: 231, class: "dk-clock-hand" }));
+      g.push(text(408, 268, "t1 — the clock stops at the ack", { size: 10.5, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(text(320, 120, "RC in-order: the ack CQE can only follow every data CQE", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 300, g);
+      return fig("The client's CQ at the end of a size — in order (ADR-0003)", svg,
+        ["data CQEs and the done-send CQE precede the ack CQE", "the pass set consumes them; the wait stops at the ack",
+         "t1 is stamped the moment the ack receive completes"]);
+    },
+
+    "rt-timeline"() {
+      const g = [];
+      g.push(node(40, 46, 230, 58, "1 · CLIENT", ["posts the done — always signaled"]));
+      g.push(node(370, 116, 240, 58, "2 · SERVER", ["done receive → verify → ack SEND"]));
+      g.push(node(40, 186, 230, 58, "3 · CLIENT", ["t1 at the ack receive completion"]));
+      g.push(node(370, 256, 240, 58, "4 · SERVER", ["consumes the ack-send completion"]));
+      g.push(curve(270, 80, 320, 130, { cls: "dk-arrow-data", marker: "dk-a-data", bend: 6 }));
+      g.push(curve(370, 150, 270, 218, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", bend: -6 }));
+      g.push(curve(270, 218, 320, 268, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", bend: 6 }));
+      g.push(text(320, 40, "time", { size: 10, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(el("circle", { cx: 155, cy: 240, r: 11, class: "dk-clock" }));
+      g.push(el("line", { x1: 155, y1: 240, x2: 155, y2: 231, class: "dk-clock-hand" }));
+      g.push(text(155, 258, "t1", { size: 10, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+
+      const svg = canvas(640, 330, g);
+      return fig("The exchange, end to end — four beats per size (bw.c:1010–1049)", svg,
+        ["<b>~10 µs</b> per round trip — inside every measured window", "the ack-send completion is consumed before the next done (audit fix)",
+         "21 exchanges per run — the pool's 32 receives never refresh"]);
+    },
+
+    "envelope-chart"() {
+      const box = document.createElement("div");
+      box.className = "chart-box";
+      window.EnvelopeChart(box);
+      return fig("The measured envelope — means of 3 default sweeps, mlxstud03/04 (ADR-0007)", box,
+        ["peak <b>42.59</b> Gbps (64 KB) · 1 MB at <b>40.57</b>", "three regimes: copy ≤ 1 KB · floor at 2 KB · host interface ≥ 4 KB",
+         "the 1 MB dip: R × 80/84 = <b>40.54</b> predicted vs 40.57 measured"]);
+    },
+
+    "envelope-regimes"() {
+      const g = [];
+      const y0 = 62, y1 = 218, x0 = 40, x1 = 610;
+      g.push(el("line", { x1: x0, y1: y1, x2: x1, y2: y1, class: "dk-axis" }));
+      g.push(el("line", { x1: x0, y1: y0, x2: x0, y2: y1, class: "dk-axis" }));
+      g.push(rect(x0 + 6, y0 + 16, 128, y1 - y0 - 16, { rx: 10, cls: "dk-zone-inline" }));
+      g.push(rect(x0 + 140, y0 + 16, 62, y1 - y0 - 16, { rx: 10, cls: "dk-zone-ramp" }));
+      g.push(rect(x0 + 208, y0 + 16, 362, y1 - y0 - 16, { rx: 10, cls: "dk-zone-flat" }));
+      /* the envelope shape, schematically */
+      const pts = [
+        [x0 + 12, y1 - 6], [x0 + 34, y1 - 8], [x0 + 56, y1 - 10], [x0 + 78, y1 - 12],
+        [x0 + 100, y1 - 16], [x0 + 122, y1 - 22], [x0 + 134, y1 - 60],
+        [x0 + 150, y1 - 92], [x0 + 171, y1 - 96], [x0 + 210, y1 - 96],
+        [x0 + 280, y1 - 98], [x0 + 380, y1 - 100], [x0 + 480, y1 - 104], [x0 + 560, y1 - 112],
+      ];
+      g.push(path(pts.map((p, i) => (i ? "L" : "M") + p[0] + "," + p[1]).join(" "), { cls: "dk-arrow-data", marker: "" }));
+      pts.forEach((p) => g.push(el("circle", { cx: p[0], cy: p[1], r: 3, class: "dk-dot-tiny" })));
+      g.push(text(x0 + 70, y1 - 42, "inline copy", { size: 10.5, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(x0 + 70, y1 - 28, "~853 MB/s", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(x0 + 171, y1 - 56, "2 KB", { size: 10.5, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(x0 + 380, y1 - 80, "flat rate R — the host interface", { size: 10.5, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(x0 + 380, y1 - 64, "42.5 Gbps · dev pair 38.3", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(x0 + 540, y1 - 128, "1 MB dip", { size: 10, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(x0 + 540, y1 - 140, "R × 80/84", { size: 9.5, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(320, 40, "≤ 1 KB", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(320, 246, "FDR (~54.5 Gbps net) is never the bound — the regimes are per-message costs, stacked by size", { size: 10, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 270, g);
+      return fig("Three regimes, three per-message costs (ADR-0004/0005/0007, research #12/#13)", svg,
+        ["<b>≤ 1 KB</b>: the HCA's inline copy — byte-proportional, 5.84–6.55 Gbps", "<b>2 KB</b>: the ~495 ns DMA floor — 32.67 Gbps",
+         "<b>4 KB–1 MB</b>: the flat host-interface rate R — 42.36–42.50, declining to 40.57"]);
+    },
+
+    "warmup-window"() {
+      const g = [];
+      const axisY = 150;
+      g.push(el("line", { x1: 30, y1: axisY, x2: 610, y2: axisY, class: "dk-axis" }));
+      /* 80 timed WRITEs as a long bar, 4 warmup WRITEs ahead */
+      g.push(rect(40, axisY - 24, 430, 48, { cls: "dk-timed" }));
+      g.push(text(255, axisY - 2, "80 timed WRITEs", { size: 11.5, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(rect(480, axisY - 18, 60, 36, { cls: "dk-warmup" }));
+      g.push(text(510, axisY + 4, "4 warmup", { size: 10, weight: 600, anchor: "middle" }));
+      g.push(flag(478, axisY + 26, "t0"));
+      g.push(el("path", { d: `M478,${axisY + 44} L478,${axisY + 54} L540,${axisY + 54} L540,${axisY + 44}`, class: "dk-bracket", fill: "none" }));
+      g.push(text(509, axisY + 74, "the warmup's ~0.79 ms of wire time is inside the window", { size: 9.5, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(rect(60, 40, 280, 56, { cls: "dk-subbox" }));
+      g.push(text(70, 60, "reported = R × n / (n + 4)", { size: 12, mono: true, weight: 700, cls: "dk-text-strong" }));
+      g.push(text(70, 78, "1 MB: R × 80/84 = 95.2% of R", { size: 10.5, cls: "dk-text-muted" }));
+      g.push(rect(360, 40, 240, 56, { cls: "dk-subbox" }));
+      g.push(text(370, 60, "predicts 40.54 · measured 40.57", { size: 11, mono: true, weight: 700, cls: "dk-text-accent" }));
+      g.push(text(370, 78, "every DMA size 32 KB–1 MB, both pairs, within 0.05%", { size: 9.5, cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 250, g);
+      return fig("The 1 MB dip — warmup-in-window arithmetic (bw.c:111–121, research #13)", svg,
+        ["<b>80 + 4</b> WRs at 1 MB — the '80-WR stream' of ADR-0007", "the 256 KB/512 KB points share count 160 and measure the same rate",
+         "warmup ≥ W would recover ~<b>1.76 Gbps</b> — the improvement ticket's trade (issue #18)"]);
+    },
+
+    "envelope-ramp"() {
+      const g = [];
+      const y0 = 60, y1 = 210, x0 = 50, x1 = 610;
+      g.push(el("line", { x1: x0, y1: y1, x2: x1, y2: y1, class: "dk-axis" }));
+      g.push(el("line", { x1: x0, y1: y0, x2: x0, y2: y1, class: "dk-axis" }));
+      /* the floor: a horizontal line at ~500 ns */
+      g.push(el("line", { x1: x0 + 10, y1: 120, x2: x1 - 10, y2: 120, class: "dk-arrow-ctrl" }));
+      g.push(pill(x0 + 200, 108, "the DMA floor — ~490–500 ns / message", 0, { size: 10 }));
+      /* wire time per size */
+      const sizes = [
+        { x: x0 + 40, t: "1 KB", v: 120, note: "inline — no floor" },
+        { x: x0 + 160, t: "2 KB", v: 78, note: "wire 385 ns < floor" },
+        { x: x0 + 300, t: "4 KB", v: 168, note: "wire 771 ns > floor" },
+        { x: x0 + 460, t: "64 KB", v: 190, note: "wire 12 µs — floor invisible" },
+      ];
+      sizes.forEach((s) => {
+        g.push(el("line", { x1: s.x, y1: 120, x2: s.x, y2: s.v, class: "dk-arrow-data" }));
+        g.push(el("circle", { cx: s.x, cy: s.v, r: 4, class: "dk-dot-big" }));
+        g.push(text(s.x, y1 + 18, s.t, { size: 10, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+        g.push(text(s.x, s.v - 12, s.note, { size: 9, anchor: "middle", cls: "dk-text-muted" }));
+      });
+      g.push(text(330, 30, "per-message time: wire time vs the floor — the bound is whichever is longer", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(callout(60, 244, 300, { title: "The crossover: between 2 and 4 KB, on both pairs", sub: "which is why exactly one sweep point (2 KB) is transitional" }));
+      g.push(text(330, 130, "501.5 vs 488.6 ns — pair-invariant in absolute time, while R differs by 11%", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 290, g);
+      return fig("The 2 KB ramp — a per-message floor, not a batch cost (research #13)", svg,
+        ["2 KB: 2048 B × 8 / ~501 ns = <b>32.67 Gbps</b>", "same count, window, and schedule as 4 KB (20480) — the difference is per-message",
+         "from 4 KB the wire time hides the floor and R rules"]);
+    },
+
+    "pair-gap"() {
+      const g = [];
+      const x0 = 120, y0 = 70, x1 = 590;
+      g.push(el("line", { x1: x0, y1: y0, x2: x1, y2: y0, class: "dk-axis" }));
+      g.push(el("line", { x1: x0, y1: y0, x2: x0, y2: 250, class: "dk-axis" }));
+      /* FDR capacity line */
+      g.push(el("line", { x1: x0 + 10, y1: 90, x2: x1 - 10, y2: 90, class: "dk-ref" }));
+      g.push(pill(x0 + 300, 80, "FDR capacity ~54.5 Gbps net", 0, { size: 9.5 }));
+      g.push(text(40, 100, "Gbps", { size: 10, cls: "dk-text-muted" }));
+      /* the two bars */
+      g.push(rect(x0 + 60, 214, 60, 36, { cls: "dk-zone-ramp" }));
+      g.push(text(x0 + 90, 250, "dev pair", { size: 10, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(x0 + 90, 205, "38.28", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(rect(x0 + 180, 192, 60, 58, { cls: "dk-zone-inline" }));
+      g.push(text(x0 + 210, 250, "final pair", { size: 10, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(x0 + 210, 185, "42.57", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(callout(60, 60, 300, { title: "Same HCA family, two flat rates — the gap is the host", sub: "the effective DMA read bandwidth over PCIe, machine-dependent" }));
+      g.push(text(330, 40, "the inline plateau and the 2 KB floor are identical on both pairs —", { size: 10, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(330, 56, "only the component crossing the host interface differs (research #13)", { size: 10, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 280, g);
+      return fig("The pair gap — the host interface, not the link (research #13)", svg,
+        ["dev <b>38.28</b> vs final <b>42.57</b> — 11% apart, both far below FDR", "Gen2 x8 ruled out: 38.2 > its 32 Gbps ceiling — both most plausibly Gen3 x8",
+         "the exact cause (slot, CPU, BIOS, firmware) is unrecorded — on-node probes only"]);
+    },
+
+    "anomaly-map"() {
+      const g = [];
+      const rows = [
+        { y: 30, t: "≤ 1 KB plateau — 6.55 Gbps", m: "the HCA's inline payload copy at ~853 MB/s", s: "attributed · killer experiment pending", k: "warn" },
+        { y: 96, t: "2 KB ramp — 32.67 Gbps", m: "the ~495 ns per-message DMA floor", s: "explained to 0.1%", k: "ok" },
+        { y: 162, t: "1 MB dip — 40.57 Gbps", m: "warmup-in-window arithmetic: R × 80/84", s: "explained to 0.1%", k: "ok" },
+        { y: 228, t: "~6.1M msg/s ceiling", m: "completion-slaved per-message rate, flat 163 ns", s: "two candidates · on-node clock test", k: "warn" },
+        { y: 294, t: "pair gap — 38.3 vs 42.6 Gbps", m: "the host interface, not the wire", s: "attributed · needs lspci on the nodes", k: "warn" },
+      ];
+      rows.forEach((r) => {
+        g.push(rect(40, r.y, 420, 46, { cls: r.k === "ok" ? "dk-timed" : "dk-warmup" }));
+        g.push(text(52, r.y + 18, r.t, { size: 11, weight: 700, cls: "dk-text-strong" }));
+        g.push(text(52, r.y + 34, r.m, { size: 10, cls: "dk-text-muted" }));
+        g.push(pill(510, r.y + 23, r.s, 0, { size: 9.5 }));
+      });
+      g.push(text(320, 366, "three explained to 0.1%, two attributed by elimination — each with a crisp one-line viva story", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 380, g);
+      return fig("Five anomalies, five stories — nothing on the envelope is unexplained (research #11/#12/#13)", svg,
+        ["the numbers are arithmetic and attribution, not magic", "each story has its chapter: wire / completions / this stop",
+         "the confirming experiments are the user's on-node checklists"]);
+    },
+
+    "adr-map"() {
+      const g = [];
+      const rows = [
+        { n: "0001", t: "Control on the data QP", r: "rejected: the done over TCP" },
+        { n: "0002", t: "Refill · batch · declare-then-read-back", r: "rejected: wait-for-all · buffer cycling · the inline query" },
+        { n: "0003", t: "The clock runs to the ack", r: "rejected: stop at the last post · two clocks" },
+        { n: "0004", t: "The T4 baseline", r: "decision: don't chase the ≤ 1 KB plateau" },
+        { n: "0005", t: "The T5 A/B", r: "decision: pipeline pays, never regresses" },
+        { n: "0006", t: "Dev-pair campaign", r: "decision: W = 256 / K = 64 stand" },
+        { n: "0007", t: "Final campaign", r: "decision: defaults unchanged, envelope locked" },
+      ];
+      rows.forEach((r, i) => {
+        const y = 32 + i * 44;
+        g.push(rect(40, y, 560, 36, { cls: "dk-subbox" }));
+        g.push(pill(82, y + 18, "ADR-" + r.n, 0, { size: 9, mono: true }));
+        g.push(text(130, y + 15, r.t, { size: 11, weight: 700, cls: "dk-text-strong" }));
+        g.push(text(130, y + 29, r.r, { size: 9.5, italic: true, cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 356, "the pattern: measure, don't guess — and name what you rejected", { size: 11, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 380, g);
+      return fig("The seven decisions and the alternatives they rejected", svg,
+        ["three protocol/pipeline decisions, four measurement records", "each rejection has a measured or structural reason",
+         "this map is the viva's table of contents"]);
+    },
+
+    "adr-0001"() {
+      const g = [];
+      g.push(node(28, 60, 260, 130, "CHOSEN — the data QP carries it all", [
+        "RDMA WRITEs, in order",
+        "the done SEND after each timed batch",
+        "the ack SEND back",
+      ], { accent: true }));
+      g.push(node(360, 60, 252, 130, "REJECTED — the done over TCP", [
+        "a TCP message is not ordered against",
+        "the WRITEs — the ack could arrive",
+        "while the last ones are still on the wire",
+      ]));
+      g.push(text(320, 40, "the rejected alternative of ADR-0001", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(el("line", { x1: 288, y1: 125, x2: 360, y2: 125, class: "dk-arrow-ctrl" }));
+      g.push(callout(60, 218, 520, { title: "Why the clock would lie", sub: "ack arrival implies every prior WRITE landed — only if the done rode the same in-order QP; the assignment mandates the ack as a SEND" }));
+
+      const svg = canvas(640, 268, g);
+      return fig("ADR-0001 — control rides the data QP; TCP never carries a control byte", svg,
+        ["consequence: the 32-deep receive pool, posted once, never refreshed", "both messages verified: fixed tag + sequence counter",
+         "a second control QP would be just as unordered — one QP is the minimum true barrier"]);
+    },
+
+    "adr-0002"() {
+      const g = [];
+      g.push(rect(40, 60, 260, 150, { cls: "dk-warmup" }));
+      g.push(text(170, 82, "REJECTED — wait-for-all", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(170, 104, "post a window …", { size: 10, anchor: "middle" }));
+      g.push(text(170, 122, "wait for ALL of it …", { size: 10, anchor: "middle" }));
+      g.push(text(170, 140, "… then repost", { size: 10, anchor: "middle" }));
+      g.push(el("line", { x1: 70, y1: 160, x2: 270, y2: 160, class: "dk-axis" }));
+      g.push(rect(70, 156, 200, 8, { cls: "dk-slot-filled" }));
+      g.push(text(170, 186, "the SQ drains to zero for ~an RTT", { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(170, 200, "every window — the NIC idles by design", { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(rect(340, 60, 260, 150, { cls: "dk-timed" }));
+      g.push(text(470, 82, "CHOSEN — refill-never-empty", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(470, 104, "reclaim the CQEs that are ready", { size: 10, anchor: "middle" }));
+      g.push(text(470, 122, "repost immediately", { size: 10, anchor: "middle" }));
+      g.push(text(470, 140, "the SQ never empties", { size: 10, anchor: "middle" }));
+      g.push(el("line", { x1: 370, y1: 160, x2: 570, y2: 160, class: "dk-axis" }));
+      g.push(rect(370, 156, 200, 8, { cls: "dk-slot-filled" }));
+      g.push(text(470, 186, "completions reclaimed in K-sized steps", { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(470, 200, "RC in-order keeps the accounting exact", { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(callout(60, 230, 520, { title: "The cost of the rejected pattern", sub: "every window re-pays the ramp-up dip; the pipeline's win at ≤ 64 B (+37–67%) comes from K-batched posts and the refill together" }));
+
+      const svg = canvas(640, 280, g);
+      return fig("ADR-0002 — the refill discipline vs the template's wait-for-all (bw_template.c:542–588)", svg,
+        ["the template empties the queue for ~an RTT every window", "the refill reclaims only what is ready and reposts",
+         "one 1 MB buffer, registered once, never modified — no buffer-reuse hazard at full window depth"]);
+    },
+
+    "adr-inline"() {
+      const g = [];
+      const y0 = 60;
+      [1024, 960, 896, 832, 768].forEach((s, i) => {
+        g.push(rect(60, y0 + i * 26, 200, 20, { cls: i === 0 ? "dk-timed" : "dk-warmup" }));
+        g.push(text(80, y0 + i * 26 + 15, "declare " + s, { size: 10, mono: true, weight: 600, cls: i === 0 ? "dk-text-accent" : "dk-text-strong" }));
+      });
+      g.push(text(60, y0 + 5 * 26 + 14, "… 64-byte steps down to 0, until creation succeeds", { size: 9.5, italic: true, cls: "dk-text-muted" }));
+      g.push(text(330, 84, "the QP mlx4 accepts", { size: 10.5, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(curve(260, 70, 360, 120, { cls: "dk-arrow-data", marker: "dk-a-data", bend: 0 }));
+      g.push(node(360, 128, 250, 92, "READ BACK — the runtime value", [
+        "ibv_query_qp(IBV_QP_CAP)",
+        "max_inline_data = what was created",
+        "the data path uses THIS (bw.c:906)",
+      ], { accent: true }));
+      g.push(callout(60, 232, 540, { title: "Rejected: ibv_query_device", sub: "its max_inline_data field is gone on modern rdma-core — not portable across the course nodes' old OFED and a WSL compile gate" }));
+      g.push(text(320, 40, "'we asked the hardware, not a header'", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 282, g);
+      return fig("ADR-0002 — inline, declared then read back (bw.c:614–661)", svg,
+        ["mlx4 rejects QP creation when the declaration exceeds what its WQEs carry", "the stepping loop: 1024 → 0 in 64-byte steps, 0 is the floor",
+         "the sq_depth read-back paces the refill the same way (memory-region stop)"]);
+    },
+
+    "adr-0003"() {
+      const g = [];
+      const rows = [
+        { y: 50, tag: "✗ rejected", t: "stop at the last post", d: "completion means SENT, not received — the local enqueue rate, the assignment's warning", on: false },
+        { y: 130, tag: "✓ chosen", t: "first timed post → ack", d: "ex1-identical window: 'the clock runs until the ACK arrives' — byte-identical output", on: true },
+        { y: 210, tag: "✗ rejected", t: "two clocks, one per side", d: "a different quantity than ex1's, plus synchronization and a seam to decide", on: false },
+      ];
+      rows.forEach((r) => {
+        g.push(rect(40, r.y, 560, 56, { cls: r.on ? "dk-timed" : "dk-warmup" }));
+        g.push(text(56, r.y + 19, r.tag, { size: 9.5, weight: 700, cls: r.on ? "dk-text-accent" : "dk-text-muted" }));
+        g.push(text(56, r.y + 38, r.t, { size: 11, weight: 700, cls: "dk-text-strong" }));
+        g.push(text(330, r.y + 26, r.d, { size: 9.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 296, "the ack is inside the measured window — the server's ack speed is on the client's clock by design", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 316, g);
+      return fig("ADR-0003 — the clock window, and the two rejected alternatives", svg,
+        ["~10 µs round trip inside every measurement — negligible above 1 B, identical in shape", "client-side completion ≠ delivery — the audit's rule of thumb",
+         "same 21 lines as ex1: size, throughput, unit — nothing else"]);
+    },
+
+    "adr-0005"() {
+      const g = [];
+      const x0 = 110, base = 200;
+      g.push(el("line", { x1: x0, y1: base, x2: 620, y2: base, class: "dk-axis" }));
+      g.push(el("line", { x1: x0, y1: 50, x2: x0, y2: base, class: "dk-axis" }));
+      g.push(text(40, 56, "Mbps", { size: 10, cls: "dk-text-muted" }));
+      const pts = [
+        { t: "1 B", t4: 36.2, t5: 49.6 },
+        { t: "8 B", t4: 238.8, t5: 396.3 },
+        { t: "32 B", t4: 948.1, t5: 1580 },
+        { t: "64 B", t4: 1850, t5: 2650 },
+      ];
+      const h = (v) => (v / 2700) * 150;
+      pts.forEach((p, i) => {
+        const x = x0 + 50 + i * 120;
+        g.push(rect(x, base - h(p.t4), 42, h(p.t4), { cls: "dk-warmup" }));
+        g.push(rect(x + 52, base - h(p.t5), 42, h(p.t5), { cls: "dk-timed" }));
+        g.push(text(x + 26, base + 18, p.t, { size: 9.5, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      });
+      g.push(rect(x0 + 50 + 480, 0, 0, 0, { cls: "dk-warmup" }));
+      g.push(rect(150, 236, 42, 10, { cls: "dk-warmup" }));
+      g.push(text(176, 250, "T4 naive", { size: 9.5, anchor: "middle" }));
+      g.push(rect(210, 236, 42, 10, { cls: "dk-timed" }));
+      g.push(text(236, 250, "T5 pipeline", { size: 9.5, anchor: "middle" }));
+      g.push(callout(60, 40, 300, { title: "+37–67% at ≤ 64 B", sub: "K-batched posts removed the per-WR doorbell" }));
+      g.push(text(400, 56, "128 B – 1 MB: identical to T4 to three digits", { size: 10, italic: true, cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 270, g);
+      return fig("ADR-0005 — the A/B: pipeline vs naive, point by point, same pair", svg,
+        ["1 B: 36.2 → 49.6 Mbps · 64 B: 1.85 → 2.65 Gbps", "no size regressed — 'the pipeline pays, never regresses' is met at every point",
+         "the DMA regime unchanged ⇒ the 38 Gbps ceiling is the host interface, not the signaling"]);
+    },
+
+    "adr-0007"() {
+      const g = [];
+      g.push(node(40, 50, 560, 180, "THE A/B — six anchor sizes, four parameter sets", [
+        "1 B:   0.04954  vs  0.04956 / 0.049505 / 0.04957   (within 0.07%)",
+        "32 B:  1.56     vs  1.56 / 1.56 / 1.56",
+        "256 B: 5.84     vs  5.84 / 5.84 / 5.84",
+        "1 KB:  6.55     vs  6.55 / 6.55 / 6.55",
+        "64 KB: 38.03    vs  38.03 / 38.035 / 38.035",
+        "1 MB:  40.567   vs  40.59 / 40.65 / 40.53",
+      ]));
+      g.push(callout(60, 252, 520, { title: "No alternative beats the defaults by ≥ 1% anywhere", sub: "W = 256 / K = 64 stand on both pairs — the hardware agrees with the assumed optimum (ADR-0006/0007)" }));
+
+      const svg = canvas(640, 302, g);
+      return fig("The T6 campaign — the numbers that locked the defaults", svg,
+        ["<b>26/26</b> client-side, <b>11/11</b> server-side checks, no QP errors", "CV ≤ 0.40% everywhere — 0.00% at the large sizes on the dev pair",
+         "K = 128 halves the CQEs and changes nothing — the ceiling is flat, not CQE-bound"]);
+    },
+
+    "audit-verdicts"() {
+      const g = [];
+      const rows = [
+        { n: "1", t: "Counts-table fit", v: "correct", d: "optimizable: no static assert" },
+        { n: "2", t: "Sequence counter", v: "correct" },
+        { n: "3", t: "Control receive pool (32 vs 21)", v: "correct" },
+        { n: "4", t: "PSN wrap", v: "correct" },
+        { n: "5", t: "Inline-size stepping", v: "correct", d: "cosmetic errno nit" },
+        { n: "6", t: "Refill / poll logic", v: "correct", d: "1 comment wrong · 1 unreachable mode" },
+        { n: "7", t: "Error paths", v: "correct", d: "parse-validation nits" },
+        { n: "8", t: "Client→server symlink", v: "correct" },
+        { n: "9", t: "Timer resolution", v: "correct" },
+        { n: "10", t: "Window / done-fits invariant", v: "correct", d: "proved, clamped + un-clamped" },
+        { n: "11", t: "Measurement methodology", v: "optimizable", d: "warmup < W, inherited, not a bug" },
+        { n: "12", t: "CQ depth sizing", v: "correct", d: "hardening nit" },
+      ];
+      rows.forEach((r, i) => {
+        const y = 34 + i * 25;
+        g.push(text(48, y + 13, r.n, { size: 9.5, mono: true, cls: "dk-text-muted" }));
+        g.push(text(66, y + 13, r.t, { size: 10.5, weight: 600, cls: "dk-text-strong" }));
+        g.push(pill(396, y + 9, r.v, 0, { size: 9, mono: true }));
+        g.push(text(432, y + 13, r.d || "", { size: 9, italic: true, cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 350, "headline: no correctness bugs — the assignment and all 7 ADRs satisfied", { size: 11, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 700 }));
+
+      const svg = canvas(640, 372, g);
+      return fig("The verdicts — twelve components, one headline (audit-bw-c.md)", svg,
+        ["reviewed on two axes: Spec (assignment + ADRs) and Standards (the repo's own discipline)", "the one inaccurate comment and the four hardenings have their own frames",
+         "findings: docs/research/audit-bw-c.md"]);
+    },
+
+    "audit-comment"() {
+      const g = [];
+      g.push(node(40, 50, 270, 130, "WARMUP RESIDUAL — 4–32 WRs", [
+        "no CQEs of its own (warmup < K)",
+        "covered by the FIRST multiple-of-k",
+        "CQE — the refill consumes it",
+      ], { accent: true }));
+      g.push(node(350, 50, 250, 130, "FINAL REMAINDER — the last list", [
+        "the stream's last WR, signaled",
+        "no list follows → the refill can't run",
+        "covered by the ACK WAIT, in order",
+      ]));
+      g.push(text(320, 40, "two leftovers, two covers — the comment credits both to the ack wait", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(callout(60, 204, 520, { title: "The comment's error (bw.c:846–849)", sub: "only the final remainder is guaranteed ack-wait-consumed; the warmup residual is absorbed by the refill's first CQE — the code is right either way (audit finding 6, note B)" }));
+
+      const svg = canvas(640, 254, g);
+      return fig("The one wrong comment — who actually covers the leftovers", svg,
+        ["warmups are 4–32 WRs < K = 64 — they generate zero CQEs of their own", "positions 1..64 with warmup 16: the first multiple-of-k CQE covers them exactly",
+         "the accounting never depended on the wrong reading — exact in both readings"]);
+    },
+
+    "audit-nits"() {
+      const g = [];
+      const rows = [
+        { y: 40, t: "validate k < sq_depth after the read-back", d: "kills the theoretical refill spin — unreachable: T6 proves max_qp_wr ≥ 1536 on both pairs" },
+        { y: 108, t: "_Static_assert on the counts tables", d: "pins the 21-entry invariant — an under-long table compiles silently and reads zeros" },
+        { y: 176, t: "-n parse-error check", d: "-n -5 wraps to ~2⁶⁴−4 — a run that effectively never ends" },
+        { y: 244, t: "cosmetic: strerror(errno) after ibv_create_qp", d: "ibv_create_qp does not reliably set errno — the message may say \"Success\"" },
+      ];
+      rows.forEach((r) => {
+        g.push(rect(40, r.y, 560, 52, { cls: "dk-subbox" }));
+        g.push(text(56, r.y + 19, r.t, { size: 11, weight: 700, cls: "dk-text-strong" }));
+        g.push(text(56, r.y + 37, r.d, { size: 10, cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 326, "none blocks submission — each is a robustness fix, not a bug", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 344, g);
+      return fig("The four hardenings (audit findings 5–7, 10–11)", svg,
+        ["the spin needs sq_depth ≤ k — impossible on course hardware", "the warmup ≥ W lead is the improvement ticket's trade, not a hardening",
+         "whether to take these and re-measure: issue #18's decision"]);
+    },
+
+    "audit-invariant"() {
+      const g = [];
+      g.push(node(40, 50, 270, 160, "THE CHAIN (un-clamped)", [
+        "k ≤ window && k ≤ QP_SLACK — in main",
+        "sq_depth = window + QP_SLACK",
+        "refill exits: out < W && out + k < sq_depth",
+        "after a K-list: out ≤ sq_depth − 1",
+        "⇒ the done SEND always fits",
+      ], { accent: true }));
+      g.push(node(340, 50, 270, 160, "THE CLAMP CASE (max_qp_wr)", [
+        "sq_depth < W + K",
+        "condition 2 paces at sq_depth − k",
+        "out ≤ sq_depth − k − 1 before each post",
+        "⇒ out ≤ sq_depth − 1 after — done fits",
+        "arbitrary -r values stay safe",
+      ]));
+      g.push(text(320, 240, "the audit PROVED it, both clamped and un-clamped (finding 10)", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 268, g);
+      return fig("The window / done-fits invariant — proved, not assumed (bw.c:871–872, 1215–1218)", svg,
+        ["CQ depth = sq_depth + 32 — the true worst case, can never overflow", "the refill's condition 2 is what makes any -r value safe",
+         "the proof is why 'k ≤ window && k ≤ QP_SLACK' is enforced before any device work"]);
+    },
+
+    "audit-evidence"() {
+      const g = [];
+      const chips = [
+        { x: 40, y: 60, v: "26/26", t: "client-side checks, dev pair" },
+        { x: 232, y: 60, v: "11/11", t: "server-side checks, both pairs" },
+        { x: 424, y: 60, v: "18", t: "campaign sweeps, no QP errors" },
+        { x: 40, y: 148, v: "≥ 1536", t: "max_qp_wr proven on both pairs" },
+        { x: 232, y: 148, v: "≤ 0.40%", t: "CV at every size (0.00% dev large)" },
+        { x: 424, y: 148, v: "×2.0", t: "doubling with size, every sweep" },
+      ];
+      chips.forEach((c) => {
+        g.push(rect(c.x, c.y, 176, 62, { cls: "dk-subbox" }));
+        g.push(text(c.x + 88, c.y + 24, c.v, { size: 15, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+        g.push(text(c.x + 88, c.y + 44, c.t, { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 246, "the risky edges are unreachable and the nuance is invisible — no new experiment needed", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 270, g);
+      return fig("What the existing records already prove (ADR-0006/0007)", svg,
+        ["the T6 sets requested max_send_wr 1536/1280/1536 — all created and passed", "warmup-shape effects are below the noise: doubling-with-size holds in every sweep",
+         "18 sweeps across both pairs: no QP errors, no protocol errors at any W×K"]);
+    },
+
+    "harness-dispatch"() {
+      const g = [];
+      g.push(node(60, 70, 250, 120, "./server  (no hostname)", [
+        "role: SERVER — waits, verifies, acks",
+        "is_server = 1 → REMOTE_WRITE on the MR",
+        "runs bw_server_ctrl_exchange",
+      ]));
+      g.push(node(330, 70, 250, 120, "./client <host>", [
+        "role: CLIENT — drives the sweep",
+        "is_server = 0 → local-write only",
+        "runs bw_client_bench",
+      ]));
+      g.push(pill(320, 140, "same binary — argc decides", 0));
+      g.push(text(320, 44, "dispatch by argc, not argv[0] — the symlink is robust by construction", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(callout(80, 220, 480, { title: "Makefile: ln -sf server client", sub: "./client with no arguments acts as the server exactly as the assignment's dispatch intends (audit finding 8)" }));
+
+      const svg = canvas(640, 270, g);
+      return fig("One binary, two roles (bw.c:1205–1210, 1246)", svg,
+        ["the server waits; the client connects and drives", "both run the same init — differing in registration rights and the final bench vs exchange",
+         "a hostname argument is the ONLY difference in the whole program"]);
+    },
+
+    "harness-cli"() {
+      const g = [];
+      g.push(node(40, 50, 560, 176, "usage — the seven flags", [
+        "-p · --port — handshake port (default 18515)",
+        "-d · --ib-dev — IB device by name",
+        "-i · --ib-port — port of the device (default 1)",
+        "-r · --window — W, the window depth",
+        "-k · --signal-interval — K, max min(window, 1024)",
+        "-n · --count — override every timed count",
+        "-g · --gid-idx — GID index, else LID-based",
+      ]));
+      g.push(callout(60, 246, 520, { title: "The research checklists run through -n", sub: "-n 640 at 1 MB, -n 80 at 64 KB (the warmup model), -n 2560 at 2 KB (the floor model) — the count override is a measurement tool, not just a smoke test" }));
+
+      const svg = canvas(640, 296, g);
+      return fig("The seven flags (bw.c:1094–1112)", svg,
+        ["-r/-k are the measured tunables of ADR-0002 — the A/B used them", "-n makes the protocol testable in seconds instead of minutes",
+         "-g is the course fabric's rare path: LID-based by default (handshake stop)"]);
+    },
+
+    "harness-bounds"() {
+      const g = [];
+      g.push(node(40, 60, 180, 110, "k ≤ window", [
+        "a K-list never overshoots",
+        "the window itself",
+      ], { accent: true }));
+      g.push(node(240, 60, 180, 110, "k ≤ QP_SLACK", [
+        "the slack absorbs the last",
+        "list AND the done SEND",
+      ], { accent: true }));
+      g.push(node(440, 60, 170, 110, "sq_depth clamp", [
+        "max_send_wr ≤ max_qp_wr",
+        "the device's word",
+      ]));
+      g.push(arrow(220, 100, 240, 100, { cls: "dk-arrow-ptr", marker: "dk-a-ptr" }));
+      g.push(arrow(420, 100, 440, 100, { cls: "dk-arrow-ptr", marker: "dk-a-ptr" }));
+      g.push(callout(60, 198, 520, { title: "Together: the done-fits invariant", sub: "after the last K-list, outstanding ≤ sq_depth − 1 — the done SEND always finds a free SQ slot, for ANY -r value (audit finding 10)" }));
+      g.push(text(320, 44, "main refuses to start on a violation — usage and exit 1, before any device work", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 248, g);
+      return fig("The bounds that keep the pipeline honest (bw.c:1215–1218)", svg,
+        ["a deadlock would be silent — the refusal is loud, up front", "the clamp is what makes the refill's second condition meaningful (memory-region stop)",
+         "k ≤ QP_SLACK also bounds the refill's reclaim: one CQE per K, never beyond the slack"]);
+    },
+
+    "harness-device"() {
+      const g = [];
+      g.push(node(40, 80, 270, 120, "DEFAULT — first device", [
+        "ib_dev = *dev_list",
+        "course nodes: exactly one HCA (mlx4_0)",
+        "no device → clear error, no crash",
+      ], { accent: true }));
+      g.push(node(340, 80, 270, 120, "WITH -d — exact name walk", [
+        "strcmp over the list",
+        "a miss → 'IB device %s not found'",
+        "never a silent fallback",
+      ]));
+      g.push(text(320, 54, "one fetch, one pass — then bw_init_ctx owns the choice", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(callout(60, 228, 520, { title: "Everything downstream flows from this", sub: "QP, CQ, registrations, port attributes (LID, active MTU) — the handshake and the path MTU inherit the choice" }));
+
+      const svg = canvas(640, 278, g);
+      return fig("Picking the device (bw.c:1222–1244)", svg,
+        ["the port comes next: ibv_query_port for LID and active MTU (bw.c:1257)", "MTU feeds the QP's path_mtu — large messages use the largest packets the link allows",
+         "-d matters only on multi-HCA hosts — the course pairs have one"]);
+    },
+
+    "harness-teardown"() {
+      const g = [];
+      const steps = [
+        "destroy QP — nothing in flight (the last ack wait was the barrier)",
+        "destroy CQ — the QP no longer references it",
+        "deregister the control MR",
+        "deregister the 1 MB buffer MR",
+        "deallocate the PD",
+        "close the device context",
+        "free: ctrl_buf · buf · ctx",
+      ];
+      steps.forEach((s, i) => {
+        const y = 36 + i * 34;
+        g.push(rect(60, y, 500, 26, { cls: i === 0 ? "dk-timed" : "dk-subbox" }));
+        g.push(text(76, y + 18, s, { size: 10.5, weight: i === 0 ? 700 : 500, cls: i === 0 ? "dk-text-accent" : "dk-text-strong" }));
+      });
+      g.push(text(320, 286, "creation in reverse, each step checked — every completion consumed by the last ack wait", { size: 10.5, italic: true, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 310, g);
+      return fig("Teardown — the ordered exit (bw.c:1055–1092)", svg,
+        ["each level references the one above it — reverse order is not ceremony", "a failure anywhere returns 1; the caller exits with it",
+         "the run ends the way it lived: ordered, checked, every completion accounted"]);
+    },
   };
 })();
