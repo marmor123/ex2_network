@@ -286,7 +286,12 @@ else
     done
     alt_labels=("512/64" "256/128" "512/128")
     ndef=${#valid_defaults[@]}
-    echo "    valid sweeps: $ndef default, ${#valid_alts[0]} + ${#valid_alts[1]} + ${#valid_alts[2]} alternative"
+    n_alt=(0 0 0)
+    for j in 0 1 2; do
+        set -- ${valid_alts[$j]}
+        n_alt[$j]=$#
+    done
+    echo "    valid sweeps: $ndef default, ${n_alt[0]} + ${n_alt[1]} + ${n_alt[2]} alternative"
     if [ "$ndef" -ge 3 ]; then
         report "3 valid default-parameter sweeps" PASS
     else
@@ -381,7 +386,7 @@ else
     if [ "$ndef" -ge 3 ]; then
         alt_beats=""
         for j in 0 1 2; do
-            [ "${#valid_alts[$j]}" -lt 2 ] && continue
+            [ "${n_alt[$j]}" -lt 2 ] && continue
             for ai in "${!ANCHOR_LINES[@]}"; do
                 line=${ANCHOR_LINES[$ai]}
                 label=${ANCHOR_LABELS[$ai]}
@@ -418,7 +423,7 @@ else
             set -- $(cv_at "$line" "${valid_defaults[@]}")
             printf '             %-10s %-18s' "$label" "$1"
             for j in 0 1 2; do
-                if [ "${#valid_alts[$j]}" -ge 2 ]; then
+                if [ "${n_alt[$j]}" -ge 2 ]; then
                     set -- $(cv_at "$line" ${valid_alts[$j]})
                     printf ' %-14s' "$1"
                 else
