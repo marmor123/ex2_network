@@ -591,5 +591,316 @@
         ["the stack inlines small messages <b>even without the flag</b> (research #12)", "ADR-0004: B = <b>853 MB/s</b> copy, two independent intervals",
          "declare 1024 → read back what the hardware accepted (ADR-0002)"]);
     },
+
+    /* --- setup chapters (stops 1–3, ticket #14) --- */
+
+    "counts-table"() {
+      const g = [];
+      const counts = [1310720, 81920, 655360, 163840, 327680, 20480, 81920, 81920,
+                      40960, 20480, 20480, 20480, 20480, 2560, 2560, 2560, 640,
+                      320, 160, 160, 80];
+      const baseY = 236, bw = 26, gap = 1, x0 = 40;
+      const hOf = (c) => Math.max(8, (Math.log2(c) - 5.3) * 13);
+      counts.forEach((c, i) => {
+        const h = hOf(c);
+        const big = i === 0 || i === 20;
+        g.push(rect(x0 + i * (bw + gap), baseY - h, bw, h, {
+          rx: 2, cls: big ? "dk-slot-signaled" : "dk-slot",
+        }));
+      });
+      g.push(text(53, baseY - hOf(counts[0]) - 8, "1,310,720", { size: 10.5, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(53, baseY - hOf(counts[0]) + 16, "1 B", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(text(53 + 20 * (bw + gap), baseY - hOf(counts[20]) - 8, "80", { size: 10.5, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(53 + 20 * (bw + gap), baseY - hOf(counts[20]) + 16, "1 MB", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(spanBracket(x0, x0 + 10 * (bw + gap) - gap, baseY + 8, "message-rate regime"));
+      g.push(spanBracket(x0 + 15 * (bw + gap), x0 + 21 * (bw + gap) - gap, baseY + 8, "wire regime"));
+      g.push(callout(430, 40, 190, { title: "Counts fall as sizes rise", sub: "the smallest stable batch per size — ex1's convergence (< 1% variance)" }));
+      g.push(text(40, 30, "log scale: each bar is log2 of the size's count", { size: 10, italic: true, cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 278, g);
+      return fig("The counts table — one count per size, ex1's converged numbers (bw.c:111–121)", svg,
+        ["1 B → <b>1,310,720</b> WRITEs · 1 MB → <b>80</b>", "≈ <b>2.86M</b> WRITEs per sweep — far below the 2^24 PSN space",
+         "verbatim ex1's table (ADR-0003)"]);
+    },
+
+    "ctrl-msg"() {
+      const g = [];
+      g.push(rect(140, 60, 170, 74, { cls: "dk-node-accent" }));
+      g.push(text(225, 92, "0x4354524c", { size: 17, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(225, 112, "tag — 'CTRL' in ASCII", { size: 10.5, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(rect(330, 60, 170, 74, { cls: "dk-node" }));
+      g.push(text(415, 92, "0–20", { size: 17, mono: true, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(415, 112, "seq — the size index", { size: 10.5, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(spanBracket(140, 500, 150, "8 bytes — 2 × uint32"));
+      g.push(el("line", { x1: 140, y1: 80, x2: 140, y2: 134, class: "dk-axis" }));
+      g.push(el("line", { x1: 310, y1: 80, x2: 310, y2: 134, class: "dk-axis" }));
+      g.push(callout(60, 30, 210, { title: "tag proves it's control", sub: "a desync fails loudly, never prints bad numbers" }));
+      g.push(callout(370, 200, 250, { title: "seq is echoed back", sub: "the ack carries the done's seq — both sides verify both halves" }));
+
+      const svg = canvas(640, 240, g);
+      return fig("The control message — 8 bytes, tag + sequence counter (bw.c:126–133)", svg,
+        ["8 B = <b>2 × uint32</b>", "fits one inline send — <b>enforced at build time</b> (the sizeof assert)",
+         "tag or seq mismatch → abort"]);
+    },
+
+    "handshake-seq"() {
+      const g = [];
+      g.push(node(28, 110, 210, 130, "CLIENT", ["sends its QP address", "reads the server's", "signals 'ready'"]));
+      g.push(node(402, 110, 210, 130, "SERVER", ["reads the client's address", "connects the QPs (RTR → RTS)", "sends addr + rkey"]));
+      g.push(curve(238, 138, 402, 138, { label: "1 · lid:qpn:psn:gid", marker: "dk-a-data", bend: 0 }));
+      g.push(curve(402, 176, 238, 176, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", label: "2 · … :addr:rkey", bend: 0 }));
+      g.push(curve(238, 214, 402, 214, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", label: "3 · ready", bend: 0 }));
+      g.push(callout(28, 34, 260, { title: "Order is structural", sub: "the server can't reply before the client's address arrives" }));
+      g.push(callout(352, 34, 260, { title: "'ready' keeps the socket alive", sub: "the client signals receipt before closing — else the server's read truncates" }));
+      g.push(text(320, 286, "then the socket closes forever — the QP is the only link from here on", { size: 11, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+
+      const svg = canvas(640, 300, g);
+      return fig("The handshake — three messages, once, before any data flows", svg,
+        ["<b>1</b> TCP connection, once per run", "<b>128-byte</b> fixed lines, zero-padded",
+         "TCP carries addresses only — never data (ADR-0001)"]);
+    },
+
+    "dest-anatomy"() {
+      const g = [];
+      const fields = [
+        { name: "LID", src: "portinfo.lid", note: "16-bit fabric address" },
+        { name: "QPN", src: "qp->qp_num", note: "assigned by the hardware" },
+        { name: "PSN", src: "lrand48 & 0xffffff", note: "random 24-bit start" },
+        { name: "GID", src: "query_gid (or zeros)", note: "128-bit, LID-mode fabric" },
+      ];
+      fields.forEach((f, i) => {
+        const x = 40 + i * 142;
+        g.push(rect(x, 60, 128, 86, { cls: i === 2 ? "dk-node-accent" : "dk-node" }));
+        g.push(text(x + 64, 84, f.name, { size: 14, mono: true, weight: 700, anchor: "middle", cls: i === 2 ? "dk-text-accent" : "dk-text-strong" }));
+        g.push(text(x + 64, 106, f.src, { size: 9.5, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+        g.push(text(x + 64, 124, f.note, { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      });
+      g.push(text(320, 170, "the client sends these 4", { size: 10.5, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(text(320, 186, "the server sends 4 + 2 more:", { size: 10, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(rect(120, 196, 170, 60, { cls: "dk-node" }));
+      g.push(text(205, 218, "BUF_ADDR", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(205, 238, "where the client's WRITEs land", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(rect(350, 196, 170, 60, { cls: "dk-node-accent" }));
+      g.push(text(435, 218, "RKEY", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(435, 238, "the key that proves the WRITE may", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 280, g);
+      return fig("What an address is made of — and where each field comes from", svg,
+        ["<b>4</b> fields client, <b>6</b> server", "PSN: random start — a fresh stream every run",
+         "GID travels as <b>32 hex chars</b> (4 × 8)"]);
+    },
+
+    "rq-pool"() {
+      const g = [];
+      const slot = 14, gap = 4, cols = 8;
+      const x0 = 56, y0 = 56;
+      for (let i = 0; i < 32; i++) {
+        const x = x0 + (i % cols) * (slot + gap);
+        const y = y0 + Math.floor(i / cols) * (slot + gap);
+        g.push(rect(x, y, slot, slot, { rx: 2, cls: i < 21 ? "dk-slot-filled" : "dk-slot" }));
+      }
+      g.push(text(x0 + 21 * (slot + gap) / 2, y0 + 4 * (slot + gap) + 16, "21 used by one sweep", { size: 11, weight: 600, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(x0 + 21 * (slot + gap) + 2 * (slot + gap), y0 + 4 * (slot + gap) + 16, "· 11 spare", { size: 11, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(path(`M${x0 + 16 * (slot + gap) + slot / 2},${y0 + 4 * (slot + gap)} L${x0 + 16 * (slot + gap) + slot / 2},${y0 + 4 * (slot + gap) + 24}`, { cls: "dk-leader" }));
+      g.push(rect(x0, 172, 340, 56, { cls: "dk-buf" }));
+      g.push(text(x0 + 14, 194, "64-byte control area", { size: 11, weight: 700, cls: "dk-text-strong" }));
+      g.push(text(x0 + 14, 212, "all 32 receives point here — one ctrl_buf, one wr_id", { size: 9.5, mono: true, cls: "dk-text-muted" }));
+      g.push(callout(430, 60, 190, { title: "Posted before the handshake", sub: "the RQ can never be found empty (ADR-0001)" }));
+
+      const svg = canvas(640, 250, g);
+      return fig("The control receive pool — 32 pre-posted receives, never refreshed (bw.c:688–709)", svg,
+        ["<b>32</b> posted once at init", "<b>21</b> dones + <b>21</b> acks per sweep — 21 of 32 used per direction",
+         "at most one message in flight per direction → shared buffer is safe"]);
+    },
+
+    "full-io"() {
+      const g = [];
+      g.push(rect(28, 70, 180, 70, { cls: "dk-node" }));
+      g.push(text(118, 98, "the server", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(118, 118, "sends 128 bytes as a stream", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(rect(432, 70, 180, 70, { cls: "dk-node-accent" }));
+      g.push(text(522, 96, "the client's buffer", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(rect(448, 108, 148, 18, { rx: 4, cls: "dk-slot" }));
+      g.push(rect(448, 108, 144, 18, { rx: 4, cls: "dk-slot-filled", stroke: "none" }));
+      g.push(text(522, 146, "got: 128 — both chunks in", { size: 9.5, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(curve(208, 90, 432, 90, { cls: "dk-arrow-data", marker: "dk-a-data", label: "read #1 — 60 B", bend: 14 }));
+      g.push(curve(208, 120, 432, 120, { cls: "dk-arrow-data", marker: "dk-a-data", label: "read #2 — 68 B", bend: -14 }));
+      g.push(callout(60, 168, 240, { title: "TCP has no message boundaries", sub: "read() may return half a message — or more than one" }));
+      g.push(callout(360, 168, 240, { title: "The loop demands all len bytes", sub: "each read resumes where the last stopped; n <= 0 means the peer died" }));
+
+      const svg = canvas(640, 230, g);
+      return fig("Robust socket IO — why the fixed size makes the loop safe (bw.c:236–260)", svg,
+        ["read()/write() can go <b>short</b>", "loop until <b>len</b> — the parse trusts the message",
+         "fixed-size handshake lines make len known"]);
+    },
+
+    "parse"() {
+      const g = [];
+      g.push(rect(28, 40, 584, 46, { cls: "dk-code" }));
+      g.push(text(320, 68, "0002 : 00000a : 1a2b3c : fe8000…0000 : 7f000001 : 1a2b", {
+        size: 15, mono: true, weight: 600, anchor: "middle", cls: "dk-text-strong",
+      }));
+      g.push(text(320, 96, "lid · qpn · psn · gid (32 hex) · addr · rkey", { size: 10, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(curve(160, 86, 160, 130, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", label: "sscanf", bend: 6 }));
+      g.push(rect(40, 134, 240, 116, { cls: "dk-node" }));
+      g.push(text(52, 154, "struct bw_dest", { size: 10.5, mono: true, weight: 700, cls: "dk-text-strong" }));
+      ["lid", "qpn", "psn", "gid (16 raw bytes)", "buf_addr", "rkey"].forEach((f, i) => {
+        g.push(text(52, 174 + i * 12, f, { size: 10, mono: true, cls: i < 3 ? "dk-text-muted" : "dk-text-accent" }));
+      });
+      g.push(callout(320, 130, 290, { title: "The GID crosses as text", sub: "4 × 8 hex chars → ntohl → 16 raw bytes — byte order explicit" }));
+      g.push(callout(320, 210, 290, { title: "The client demands six fields", sub: "a truncated server message must not pass with addr/rkey zero" }));
+
+      const svg = canvas(640, 280, g);
+      return fig("The 128-byte line comes back as a struct (bw_parse_dest, bw.c:262–285)", svg,
+        ["sscanf against a <b>fixed layout</b>", "4 fields always · <b>6 for the client</b>",
+         "GID: byte order made explicit (htonl/ntohl)"]);
+    },
+
+    "qp-states"() {
+      const g = [];
+      const boxes = [
+        { x: 40, name: "RESET", note: "born here", cls: "dk-node" },
+        { x: 210, name: "INIT", note: "this stop — pointed at a port", cls: "dk-node-accent" },
+        { x: 380, name: "RTR", note: "knows the peer", cls: "dk-node-accent" },
+        { x: 510, name: "RTS", note: "ready to send", cls: "dk-node" },
+      ];
+      boxes.forEach((b, i) => {
+        g.push(rect(b.x, 60, 100, 56, { cls: b.cls }));
+        g.push(text(b.x + 50, 86, b.name, { size: 12, mono: true, weight: 700, anchor: "middle", cls: b.cls === "dk-node-accent" ? "dk-text-accent" : "dk-text-strong" }));
+        g.push(text(b.x + 50, 104, b.note, { size: 9, anchor: "middle", cls: "dk-text-muted" }));
+        if (i < 3) g.push(curve(b.x + 100, 88, b.x + 130, 88, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", bend: 0 }));
+      });
+      g.push(spanBracket(380, 610, 132, "the handshake stop — RTR then RTS"));
+      g.push(text(90, 40, "QP states, in order", { size: 10, cls: "dk-text-muted" }));
+      g.push(callout(40, 160, 270, { title: "RTR needs the peer's address", sub: "QPN · PSN · LID — only the handshake supplies them" }));
+      g.push(callout(360, 160, 250, { title: "RTS carries reliability", sub: "timeout 14 · retry 7 · rnr_retry 7 — RC retry behaviour" }));
+
+      const svg = canvas(640, 240, g);
+      return fig("The QP lifecycle — INIT here, RTR and RTS in the handshake", svg,
+        ["RTR = <b>ready to receive</b> · RTS = <b>ready to send</b>", "GRH addressing only when <b>both</b> sides have GIDs",
+         "a one-sided -g degrades to LID mode instead of failing (audit)"]);
+    },
+
+    "registration"() {
+      const g = [];
+      g.push(rect(28, 80, 220, 90, { cls: "dk-buf" }));
+      g.push(text(138, 102, "1 MB buffer", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      for (let i = 0; i < 11; i++) g.push(rect(44 + i * 18, 118, 14, 8, { rx: 2, cls: "dk-memcell" }));
+      g.push(text(138, 150, "page-aligned · filled 0x7b / 0x7c", { size: 9.5, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(curve(138, 170, 138, 208, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", label: "ibv_reg_mr", bend: 8 }));
+      g.push(rect(28, 212, 260, 92, { rx: 12, cls: "dk-node" }));
+      g.push(text(40, 232, "PD — protection domain", { size: 10.5, weight: 700, cls: "dk-text-strong" }));
+      g.push(rect(48, 242, 220, 48, { cls: "dk-subbox" }));
+      g.push(text(58, 262, "MR — pinned memory", { size: 10.5, weight: 600 }));
+      g.push(text(58, 280, "lkey + rkey", { size: 10, mono: true, cls: "dk-text-accent" }));
+      g.push(callout(330, 70, 280, { title: "lkey — the local key", sub: "this QP's HCA may read the buffer" }));
+      g.push(callout(330, 140, 280, { title: "rkey — the remote key", sub: "the server's only: the client's WRITEs present it; REMOTE_WRITE must be on" }));
+      g.push(text(330, 230, "the QP and the MR share the PD —", { size: 10, italic: true, cls: "dk-text-muted" }));
+      g.push(text(330, 246, "a QP can only use MRs in its own PD", { size: 10, italic: true, cls: "dk-text-muted" }));
+
+      const svg = canvas(640, 330, g);
+      return fig("Registration — the deal with the HCA (bw.c:592–605)", svg,
+        ["<b>1 MB</b>, page-aligned", "lkey: local · <b>rkey: remote write, server only</b> (ADR-0002)",
+         "never modified after init — no reuse hazard"]);
+    },
+
+    "cq-shared"() {
+      const g = [];
+      g.push(rect(240, 50, 160, 96, { cls: "dk-node-accent" }));
+      g.push(text(320, 74, "QP", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(rect(252, 84, 136, 24, { cls: "dk-subbox" }));
+      g.push(text(320, 100, "SQ — sends", { size: 9.5, anchor: "middle" }));
+      g.push(rect(252, 114, 136, 24, { cls: "dk-subbox" }));
+      g.push(text(320, 130, "RQ — receives", { size: 9.5, anchor: "middle" }));
+      g.push(curve(280, 146, 280, 186, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", label: "send completions", bend: -8 }));
+      g.push(curve(360, 146, 360, 186, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", label: "recv completions", bend: 8 }));
+      g.push(rect(200, 190, 240, 64, { cls: "dk-buf" }));
+      g.push(text(320, 214, "ONE CQ", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(320, 234, "depth = sq_depth + 32 — the worst case", { size: 9.5, mono: true, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(callout(60, 60, 190, { title: "In-order by construction", sub: "RC completions merge in order — one queue, one sequence" }));
+      g.push(callout(60, 140, 190, { title: "Never full", sub: "sized to the true worst case; a full CQ would drop completions" }));
+
+      const svg = canvas(640, 280, g);
+      return fig("One CQ for both directions — the poll loops' single source (bw.c:607–608)", svg,
+        ["one CQ for <b>send and receive</b> completions", "depth = sq_depth + 32 — <b>can never overflow</b> (audit)",
+         "every wait — refill, done, ack — reads this one queue"]);
+    },
+
+    "inline-stepping"() {
+      const g = [];
+      const rungs = [1024, 960, 896];
+      rungs.forEach((r, i) => {
+        const y = 84 + i * 40;
+        g.push(rect(60, y, 120, 30, { rx: 6, cls: i === 0 ? "dk-slot-signaled" : "dk-slot" }));
+        g.push(text(120, y + 20, String(r), { size: 12, mono: true, weight: 700, anchor: "middle", cls: i === 0 ? "dk-text-accent" : "dk-text-strong" }));
+        if (i < rungs.length - 1) g.push(el("line", { x1: 120, y1: y + 30, x2: 120, y2: y + 40, class: "dk-axis" }));
+      });
+      g.push(text(120, 220, "⋮ 0", { size: 12, mono: true, weight: 700, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(spanBracket(60, 180, 56, "declare, then step −64"));
+      g.push(text(120, 244, "mlx4 accepts → stop", { size: 10, anchor: "middle", cls: "dk-text-accent", weight: 600 }));
+      g.push(curve(180, 90, 300, 90, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", label: "created QP", bend: 0 }));
+      g.push(rect(304, 66, 130, 52, { cls: "dk-node" }));
+      g.push(text(369, 88, "ibv_query_qp", { size: 10.5, mono: true, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(text(369, 106, "read back", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(curve(434, 92, 520, 92, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", bend: 0 }));
+      g.push(rect(524, 68, 96, 48, { rx: 24, cls: "dk-node-accent" }));
+      g.push(text(572, 94, "runtime", { size: 10, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(text(572, 108, "truth", { size: 10, mono: true, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(callout(40, 260, 260, { title: "mlx4 refuses too-big declarations", sub: "no portable query exposes the ceiling — so discover it by stepping" }));
+      g.push(callout(360, 260, 250, { title: "'We asked the hardware, not a header'", sub: "the read-back is the max_inline_data the data path uses (ADR-0002)" }));
+
+      const svg = canvas(640, 320, g);
+      return fig("QP create — declare 1024, step down until accepted, read back (bw.c:623–661)", svg,
+        ["declare <b>1024</b>, step −64, ≤ <b>16</b> attempts", "the read-back is the runtime <b>max_inline_data</b>",
+         "works on the course OFED and modern rdma-core alike (ADR-0002)"]);
+    },
+
+    "sq-depth"() {
+      const g = [];
+      const x0 = 60, w256 = 200, wSlack = 360, y = 90;
+      g.push(rect(x0, y, w256, 44, { cls: "dk-slot-signaled" }));
+      g.push(text(x0 + w256 / 2, y + 27, "W = 256 — the window", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-accent" }));
+      g.push(rect(x0 + w256, y, wSlack, 44, { cls: "dk-slot" }));
+      g.push(text(x0 + w256 + wSlack / 2, y + 27, "QP_SLACK = 1024 — headroom", { size: 11, weight: 700, anchor: "middle", cls: "dk-text-strong" }));
+      g.push(rect(x0 + w256 + wSlack, y, 24, 44, { cls: "dk-warmup" }));
+      g.push(text(x0 + w256 + wSlack + 12, y - 10, "done SEND", { size: 9.5, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(spanBracket(x0, x0 + w256 + wSlack + 24, y + 60, "1280 = the default request (window + slack)"));
+      g.push(curve(120, 150, 120, 196, { cls: "dk-arrow-ctrl", marker: "dk-a-ctrl", label: "clamped by max_qp_wr", bend: 10 }));
+      g.push(text(120, 240, "a shallower QP is still safe: the refill paces by the READ-BACK sq_depth", { size: 10, anchor: "middle", cls: "dk-text-muted" }));
+      g.push(callout(380, 40, 220, { title: "The done must always fit", sub: "the slack absorbs the last list's overshoot AND the done SEND (audit)" }));
+
+      const svg = canvas(640, 250, g);
+      return fig("The SQ is not exactly W deep — window + slack (bw.c:577–582)", svg,
+        ["<b>256 + 1024 = 1280</b> requested", "course hardware: max_qp_wr ≥ <b>1536</b> (T6) — un-clamped",
+         "k ≤ QP_SLACK keeps the refill's guarantee (audit)"]);
+    },
+
+    "ctx-struct"() {
+      const g = [];
+      g.push(rect(28, 40, 240, 230, { cls: "dk-node" }));
+      g.push(text(40, 62, "struct bw_context", { size: 11, mono: true, weight: 700, cls: "dk-text-strong" }));
+      const fields = [
+        ["context", "ibv_open_device"],
+        ["pd", "ibv_alloc_pd"],
+        ["mr · ctrl_mr", "ibv_reg_mr"],
+        ["cq", "ibv_create_cq"],
+        ["qp", "ibv_create_qp"],
+        ["max_inline_data", "READ BACK"],
+        ["sq_depth", "READ BACK"],
+        ["portinfo", "ibv_query_port"],
+      ];
+      fields.forEach((f, i) => {
+        g.push(text(40, 84 + i * 22, f[0], { size: 10, mono: true, cls: f[1] === "READ BACK" ? "dk-text-accent" : "dk-text-muted" }));
+        g.push(curve(268, 84 + i * 22 - 4, 320, 84 + i * 22 - 4, { cls: "dk-arrow-ptr", marker: "dk-a-ptr", bend: 0 }));
+        g.push(text(328, 84 + i * 22, f[1], { size: 9.5, mono: true, cls: f[1] === "READ BACK" ? "dk-text-accent" : "dk-text-muted" }));
+      });
+      g.push(callout(360, 90, 250, { title: "Two fields are discovered, not chosen", sub: "max_inline_data and sq_depth come back from ibv_query_qp" }));
+      g.push(callout(360, 190, 250, { title: "Teardown walks it in reverse", sub: "QP → CQ → MRs → PD → device — the harness chapter" }));
+
+      const svg = canvas(640, 300, g);
+      return fig("The state it all builds — every resource in one struct (bw.c:188–200)", svg,
+        ["everything setup owns, in <b>one struct</b>", "two fields are <b>read-back</b>, not assumed",
+         "the handshake reads lid · qpn · mtu out of it"]);
+    },
   };
 })();

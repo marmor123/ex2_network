@@ -1,9 +1,11 @@
-# Prototype — the teaching app shell (throwaway)
+# Prototype — the teaching app shell
 
 **Question this prototype answers:** what should the app look and feel like —
 visual language, navigation, diagram style, code presentation, interactivity
 level? Resolution on [issue #9](https://github.com/marmor123/ex2_network/issues/9)
-records the design conventions the build tickets follow.
+records the design conventions the build tickets follow. The build is
+happening on this same branch — **variant D (Studio)** is the chosen design;
+variants A/B/C stay for reference.
 
 **Run it:**
 
@@ -26,10 +28,14 @@ or the arrow keys (`?variant=A|B|C` in the URL; reload-stable):
 | **C** | Viva deck | Presentation. Home is a title slide; each stop is a 4-slide deck (concept → code → why → what-if). Viva mode hides answers until you reveal them. | Arrow through it; rehearse the exam |
 | **D** | Studio | Split-screen, Claude-like (cream, white panels, terracotta). Left: code on top, explanation below. Right: a hand-drawn-style SVG diagram synced to the frame — struct design (linked lists, pointers), the connection, the live traffic — with leader-line annotations and a facts strip under every figure. One idea per frame; dotted progress + corner arrows at the bottom. | Step through the frames with the corner arrows; the diagram tracks the code |
 
-Content is shared: home (experiment, roles, envelope chart, spine) and two
-full stops — **The experiment** (ADR-0003 clock window) and **Posting the
-window** (ADR-0002 window/refill) — each with concept / annotated code /
-ADR why / viva what-ifs, using CONTEXT.md vocabulary.
+Content is shared: home (experiment, roles, envelope chart, spine) and the
+stops built so far — **The experiment** (ADR-0003 clock window), **The
+handshake** (ADR-0001 TCP exchange + control receive pool), **Memory region**
+(ADR-0002 registration + declare-then-read-back), and **Posting the window**
+(ADR-0002 window/refill) — each with concept / annotated code / ADR why /
+viva what-ifs, using CONTEXT.md vocabulary. Stops are added per the wayfinder
+build tickets (#14: setup chapters, #15: data path, #16: envelope/choices/
+audit).
 
 The envelope chart follows the dataviz skill (single-series line on log2
 sizes, crosshair + tooltip, table twin, light/dark tokens).
