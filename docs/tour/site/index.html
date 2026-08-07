@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  bw.c — a guided tour (wayfinder ticket #29, the build).
+  Static no-build site, runs from file://. Content (js/content.js) is
+  generated from bw.c + docs/tour/stations/*.md by tools/gen_content.py;
+  the route (js/route.js) transcribes docs/tour/partition.md §5.
+  ?selftest=1 runs the deep self-check; the badge in the top bar shows
+  the parse self-check results.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bw.c — a guided tour</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header id="topbar">
+  <h1><code>bw.c</code> — a guided tour</h1>
+  <span class="sub">every line, explained — walk the tour line below</span>
+  <span id="selfBadge"></span>
+</header>
+<main id="file-line" tabindex="0" aria-label="bw.c source, one line per row; click any line to explain it"></main>
+
+<div id="bubble" hidden></div>
+
+<footer id="stepper">
+  <div id="startWrap">
+    <button id="startBtn">▶ Start tour</button>
+    <button id="resetBtn" title="clear saved progress" hidden>reset</button>
+  </div>
+  <div id="track" aria-label="the tour line: the researched route, in order"></div>
+</footer>
+
+<div id="checkModal" hidden>
+  <div class="cm-card">
+    <h2>Content self-check</h2>
+    <p class="cm-sub">The renderer contract (docs/tour/stations/README.md) verified over the embedded content at load; ?selftest=1 adds the DOM checks.</p>
+    <div id="checkList"></div>
+    <button id="cmClose">Close</button>
+  </div>
+</div>
+
+<script src="js/content.js"></script>
+<script src="js/route.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
