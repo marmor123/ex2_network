@@ -1,17 +1,12 @@
 /*
- * App shell prototype — three structurally-different variants of the same
- * teaching app, switchable via ?variant=A|B|C (floating bar at the bottom).
+ * The teaching app — variant D (Studio): split-screen frames, code top-left,
+ * explanation bottom-left, synced diagram right. Content (js/content.js),
+ * the envelope chart (js/chart.js) and the diagram kit (js/diagrams.js) are
+ * shared.
  *
- *   A — Field notes   : code-first, dark. The stop IS the annotated source;
- *                       concept/why/what-if as callouts around it.
- *   B — System map    : diagram-first, light. The run as a living diagram;
- *                       stops as nodes, pipeline animation, tabbed layers.
- *   C — Viva deck     : presentation. Home is a title slide; each stop is a
- *                       slide deck (concept → code → why → what-if Q&A) with
- *                       a question-reveal viva mode.
- *
- * The question this prototype answers: which structure should the real app
- * have? Content (js/content.js) and chart (js/chart.js) are shared.
+ * Variants A (field notes), B (system map) and C (viva deck) were the
+ * design-prototype alternatives — they stay in this file, dormant, with the
+ * prototype's floating switcher bar removed.
  */
 (function () {
   const A = window.APP;
@@ -474,7 +469,7 @@
       deckEl.querySelectorAll(".slide").forEach((s) => s.classList.toggle("viva-on", reveal));
     });
 
-    /* Deck owns the arrow keys; the switcher bar stays clickable. */
+    /* The deck owns the arrow keys while it's mounted. */
     const nav = {
       next: () => show(idx + 1),
       prev: () => show(idx - 1),
@@ -676,8 +671,8 @@
   };
 
   function currentVariant() {
-    const v = new URLSearchParams(location.search).get("variant");
-    return VARIANTS[v] || VARIANTS.A;
+    /* D is the app; the A/B/C renderers stay dormant. */
+    return VARIANTS.D;
   }
 
   function currentRoute() {
@@ -700,59 +695,16 @@
     document.title = (route.stop ? route.stop.title + " — " : "") + A.title;
   }
 
-  /* ---------- Floating switcher bar ------------------------------------------- */
-
-  const bar = h("div", "prototype-bar");
-  const left = h("button", "pbtn", "‹");
-  const label = h("span", "plabel");
-  const right = h("button", "pbtn", "›");
-  bar.appendChild(h("span", "ptag", "PROTOTYPE"));
-  bar.appendChild(left);
-  bar.appendChild(label);
-  bar.appendChild(right);
-  document.body.appendChild(bar);
-
-  function setVariant(key) {
-    const p = new URLSearchParams(location.search);
-    p.set("variant", key);
-    const qs = p.toString();
-    const hash = location.hash;
-    history.replaceState(null, "", location.pathname + "?" + qs + hash);
-    render();
-  }
-
-  const keys = Object.keys(VARIANTS);
-  function keyOf() { return keys.find((k) => VARIANTS[k] === currentVariant()); }
-
-  function updateBar() {
-    const i = keys.indexOf(keyOf());
-    label.textContent = (i + 1) + "/" + keys.length + " · " + VARIANTS[keys[i]].name + " — " + keys[i];
-  }
-
-  left.addEventListener("click", () => {
-    const i = keys.indexOf(keyOf());
-    setVariant(keys[(i - 1 + keys.length) % keys.length]);
-  });
-  right.addEventListener("click", () => {
-    const i = keys.indexOf(keyOf());
-    setVariant(keys[(i + 1) % keys.length]);
-  });
-
-  /* Keyboard: ←/→ cycle variants, EXCEPT in the viva deck (C) and the studio
-   * frames (D), which own the arrows for their own navigation. */
+  /* Keyboard: ←/→ drive the studio frame navigation (and the dormant deck). */
   document.addEventListener("keydown", (e) => {
     const own = mount._deckNav || mount._frameNav;
     if (own) {
       if (e.key === "ArrowRight") own.next();
       if (e.key === "ArrowLeft") own.prev();
-      return;
     }
-    if (e.key === "ArrowRight") right.click();
-    if (e.key === "ArrowLeft") left.click();
   });
 
   window.addEventListener("hashchange", render);
   window.addEventListener("resize", render);
   render();
-  updateBar();
 })();

@@ -1,23 +1,17 @@
 <!DOCTYPE html>
 <!--
-  PROTOTYPE — throwaway by design (branch: prototype/app-shell).
-
-  Question: what should the teaching app look and feel like — visual language,
-  navigation, diagram style, code presentation, interactivity level?
-
-  Plan: three structurally-different variants of the shell, switchable via
-  ?variant=A|B|C from a floating bottom bar (arrow keys too):
-    A — Field notes  : code-first, dark, annotated-source scroll
-    B — System map   : diagram-first, light, living pipeline, tabbed layers
-    C — Viva deck    : presentation, slide decks, question-reveal viva mode
-  Content (js/content.js) and the envelope chart (js/chart.js) are shared.
-  Runs from file:// — no server, no build step: open this file.
+  bw.c — follow the data: an interactive walkthrough of the Lab 2 Verbs
+  throughput benchmark (RDMA WRITE, course ConnectX-3 pairs). Static
+  HTML/CSS/JS, no build step — this folder is served as the site root by
+  GitHub Pages. Content (js/content.js), the envelope chart (js/chart.js)
+  and the diagram kit (js/diagrams.js) are shared; js/app.js renders
+  variant D (Studio). Runs from file:// — no server needed.
 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PROTOTYPE — bw.c follow the data</title>
+  <title>bw.c — follow the data</title>
   <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
