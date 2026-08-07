@@ -1,5 +1,7 @@
-# Deploys the teaching app (prototype/app-shell/) to GitHub Pages.
-# Site root = the app folder, so the URL is clean: https://marmor123.github.io/ex2_network/
+# Deploys the teaching site to GitHub Pages: the current site
+# (prototype/app-shell/) stays at the root, the guided tour
+# (docs/tour/site/) gets its own /tour/ path. The job assembles a
+# combined folder and uploads it — both sites remain static and no-build.
 # Runs on every push to main; the workflow file itself also stays on main.
 name: Deploy app to GitHub Pages
 
@@ -26,8 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      - name: Assemble the combined site folder
+        run: |
+          mkdir -p _site/tour
+          cp -r prototype/app-shell/* _site/
+          cp -r docs/tour/site/* _site/tour/
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: prototype/app-shell
+          path: _site
       - id: deployment
         uses: actions/deploy-pages@v4

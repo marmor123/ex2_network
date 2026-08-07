@@ -2,8 +2,9 @@
 <!--
   bw.c — follow the data: an interactive walkthrough of the Lab 2 Verbs
   throughput benchmark (RDMA WRITE, course ConnectX-3 pairs). Static
-  HTML/CSS/JS, no build step — this folder is served as the site root by
-  GitHub Pages. Content (js/content.js), the envelope chart (js/chart.js)
+  HTML/CSS/JS, no build step — by GitHub Pages this folder is the site
+  root, with the guided tour served at /tour/ (wayfinder ticket #30).
+  Content (js/content.js), the envelope chart (js/chart.js)
   and the diagram kit (js/diagrams.js) are shared; js/app.js renders
   variant D (Studio). Runs from file:// — no server needed.
 -->
@@ -15,10 +16,22 @@
   <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
+  <a id="tourLink" class="tour-link">the guided tour →</a>
   <div id="app"></div>
   <script src="js/content.js"></script>
   <script src="js/chart.js"></script>
   <script src="js/diagrams.js"></script>
   <script src="js/app.js"></script>
+  <script>
+  /* Cross-link to the guided tour (ticket #30): deployed at /tour/,
+     from file:// it is ../docs/tour/site/. The app's #app never reloads,
+     so this element (outside #app) stays put across hash navigation. */
+  (function () {
+    var el = document.getElementById("tourLink");
+    el.href = location.protocol === "file:"
+      ? "../docs/tour/site/index.html"
+      : "tour/index.html";
+  })();
+  </script>
 </body>
 </html>

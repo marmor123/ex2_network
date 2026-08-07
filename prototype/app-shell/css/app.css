@@ -763,3 +763,18 @@
 }
 .prototype-bar .pbtn:hover { color: #ffd166; }
 .prototype-bar .plabel { font-size: 13px; font-weight: 600; min-width: 180px; text-align: center; }
+
+/* ---- cross-link to the guided tour (wayfinder ticket #30) ----
+   Sits outside #app (tokens are scoped under it), so it uses the light
+   theme values as fallbacks and reads on the warm Studio background. */
+.tour-link {
+  position: fixed; right: 14px; bottom: 14px; z-index: 50;
+  font-size: 12.5px; line-height: 1; font-weight: 600;
+  color: var(--ink-2, #52514e);
+  background: var(--surface-2, #f0eee7);
+  border: 1px solid var(--border, rgba(11, 11, 11, 0.10));
+  border-radius: 999px; padding: 8px 14px;
+  text-decoration: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+.tour-link:hover { color: var(--series-1, #2a78d6); }

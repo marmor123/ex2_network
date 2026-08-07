@@ -48,5 +48,9 @@ progress round-trip).
 
 ## Deploying (ticket #30)
 
-The folder is self-contained; the deploy ticket serves it at its own path
-alongside the existing site (`prototype/app-shell`).
+The folder is self-contained. The Pages workflow assembles a combined
+folder: `prototype/app-shell/` at the root, this folder at `/tour/`, so
+the tour lives at `https://marmor123.github.io/ex2_network/tour/` next to
+the unchanged course site at the root. Each site carries a cross-link to
+the other (the href is computed in JS, so both links also work from
+`file://`).

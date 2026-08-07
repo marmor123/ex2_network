@@ -18,6 +18,7 @@
 <header id="topbar">
   <h1><code>bw.c</code> — a guided tour</h1>
   <span class="sub">every line, explained — walk the tour line below</span>
+  <a id="courseLink" class="site-link">course site</a>
   <span id="selfBadge"></span>
 </header>
 <main id="file-line" tabindex="0" aria-label="bw.c source, one line per row; click any line to explain it"></main>
@@ -43,5 +44,16 @@
 <script src="js/content.js"></script>
 <script src="js/route.js"></script>
 <script src="js/app.js"></script>
+<script>
+/* Cross-link back to the course site (ticket #30): the deployed tour lives
+   at /tour/ (so "../index.html"), from file:// it is ../.. up to the repo
+   root and into prototype/app-shell/. */
+(function () {
+  var el = document.getElementById("courseLink");
+  el.href = location.protocol === "file:"
+    ? "../../../prototype/app-shell/index.html"
+    : "../index.html";
+})();
+</script>
 </body>
 </html>

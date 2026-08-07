@@ -47,6 +47,11 @@ body.content-fail #file-line { outline: 1px solid #f87171; }
 #selfBadge.warn{ color: var(--warn); border-color: rgba(251,191,36,.4); }
 #selfBadge.fail{ color: #f87171; border-color: rgba(248,113,113,.5); background: rgba(248,113,113,.08); }
 #selfBadge:hover { border-color: var(--accent); }
+#topbar .site-link {
+  color: var(--dim); font-size: 11.5px; text-decoration: none;
+  padding: 3px 8px; border-radius: 6px; border: 1px solid transparent;
+}
+#topbar .site-link:hover { color: var(--accent); border-color: var(--line); }
 
 /* ---- file line ---- */
 #file-line {
