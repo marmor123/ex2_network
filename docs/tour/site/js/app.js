@@ -221,8 +221,10 @@ function quoteBlock(chunk) {
   if (first.startsWith("**Predict**")) {
     const revIdx = lines.findIndex(l => l.startsWith("**Reveal**"));
     if (revIdx < 0) return { k: "predict", q: paras(lines).join("\n\n"), a: "", broken: true };
-    const q = paras(lines.slice(0, revIdx)).join("\n\n");
-    const a = paras(lines.slice(revIdx).map(l => l.replace(/^\*\*Reveal\*\*\s*/, "")))
+    const qLines = lines.slice(0, revIdx);
+    qLines[0] = qLines[0].replace(/^\*\*Predict\*\*\s*—\s*/, "");
+    const q = paras(qLines).join("\n\n");
+    const a = paras(lines.slice(revIdx).map(l => l.replace(/^\*\*Reveal\*\*\s*—\s*/, "")))
       .join("\n\n");
     return { k: "predict", q, a };
   }
@@ -327,14 +329,17 @@ function report(name, pass, detail, warn) {
 }
 function checkLineCoverage() {
   const ownerCount = new Map();
+  const last = SRC_LINES.length;
+  let inBounds = true;
   for (const st of STATIONS) {
     if (!Array.isArray(st.range)) continue;
+    if (st.range[0] < 1 || st.range[1] > last || st.range[0] > st.range[1]) inBounds = false;
     for (let l = st.range[0]; l <= st.range[1]; l++)
       ownerCount.set(l, (ownerCount.get(l) || 0) + 1);
   }
-  let exact = true;
-  for (let l = 1; l <= SRC_LINES.length; l++) if (ownerCount.get(l) !== 1) { exact = false; break; }
-  return { exact, sum: [...ownerCount.values()].reduce((a, b) => a + b, 0) };
+  let exact = inBounds;
+  for (let l = 1; l <= last; l++) if (ownerCount.get(l) !== 1) { exact = false; break; }
+  return { exact, inBounds, sum: [...ownerCount.values()].reduce((a, b) => a + b, 0) };
 }
 function runChecks() {
   /* content shape */
@@ -369,11 +374,13 @@ function runChecks() {
   report("headers.lines", badRange === 0, badRange ? badRange + " unparseable line ranges" : "line ranges parse");
   report("headers.skip", badSkip === 0, badSkip ? badSkip + " bad skip values" : "skip values are yes/no");
 
-  /* the partition: every line owned exactly once, capstone owns none */
+  /* the partition: every line owned exactly once, ranges inside the file,
+     capstone owns none */
   const cov = checkLineCoverage();
   report("partition.exact", cov.exact,
-    cov.sum === 1320 ? "lines 1–1320 owned exactly once (sum " + cov.sum + ")"
-      : "ownership not exact (sum " + cov.sum + ")");
+    cov.inBounds && cov.sum === 1320
+      ? "lines 1–1320 owned exactly once (sum " + cov.sum + ")"
+      : "ownership not exact (sum " + cov.sum + ", ranges in bounds: " + cov.inBounds + ")");
   const noRange = STATIONS.filter(s => !Array.isArray(s.range));
   report("partition.none-lines", noRange.length === 1 && noRange[0].id === "capstone",
     noRange.length === 1 ? "only the capstone owns no lines" : noRange.length + " stations own no lines");
@@ -439,7 +446,6 @@ const fileEl = document.getElementById("file-line");
 const bubbleEl = document.getElementById("bubble");
 const trackEl = document.getElementById("track");
 const startBtn = document.getElementById("startBtn");
-const resetBtn = document.getElementById("resetBtn");
 const badgeEl = document.getElementById("selfBadge");
 const checkModal = document.getElementById("checkModal");
 const checkList = document.getElementById("checkList");
@@ -469,10 +475,13 @@ const lineEls = []; // 1-based line number -> element
 }
 
 /* ---- stepper ---- */
-function chipTitle(st) {
-  const rng = Array.isArray(st.range) ? "lines " + st.range[0] + "–" + st.range[1]
+function rangeLabel(st) {
+  return Array.isArray(st.range)
+    ? "lines " + st.range[0] + "–" + st.range[1]
     : "content station — owns no lines";
-  return st.id + ". " + st.title + " — " + st.type + " · " + rng +
+}
+function chipTitle(st) {
+  return st.id + ". " + st.title + " — " + st.type + " · " + rangeLabel(st) +
     (st.skip ? " · skippable" : "");
 }
 function buildStepper() {
@@ -518,8 +527,9 @@ function saveProgress(prog, key) {
 }
 const prog = loadProgress();
 function markVisited(id) {
-  if (!prog.visited.includes(id)) { prog.visited.push(id); saveProgress(prog); }
-  prog.last = id; saveProgress(prog);
+  if (!prog.visited.includes(id)) prog.visited.push(id);
+  prog.last = id;
+  saveProgress(prog);
   paintStepper();
 }
 
@@ -557,22 +567,20 @@ function setPreview(lineNo) {
 function stationHTML(id) {
   const st = STATION_BY_ID.get(id);
   const pos = ROUTE_POS.get(id);
-  const rng = Array.isArray(st.range)
-    ? "lines " + st.range[0] + "–" + st.range[1]
-    : "content station — owns no lines";
-  const tagHtml = st.tags.map(t => `<span class="tag">${t}</span>`).join("");
+  const rng = rangeLabel(st);
+  const tagHtml = st.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("");
   const body = st.blocks.map((b, bi) => blockHTML(b, bi === 0)).join("");
   const prev = pos > 0 ? ROUTE[pos - 1] : null;
   const next = pos < ROUTE.length - 1 ? ROUTE[pos + 1] : null;
   return `<div class="bubble">
     <button class="b-close" id="bubbleClose" title="close (Esc)">×</button>
     <h2>${inlineHTML(st.title)}</h2>
-    <div class="b-sub"><span class="typ">${st.type}</span>${tagHtml}
+    <div class="b-sub"><span class="typ">${esc(st.type)}</span>${tagHtml}
       <span class="rng">${rng}</span>${st.skip ? '<span class="skipnote">skippable</span>' : ""}</div>
     ${body}
     <div class="b-nav">
-      <button data-nav="prev" ${prev ? "" : "disabled"}>← ${prev ? STATION_BY_ID.get(prev.id).title : "…"}</button>
-      <button data-nav="next" ${next ? "" : "disabled"}>${next ? STATION_BY_ID.get(next.id).title : "Finish"} →</button>
+      <button data-nav="prev" ${prev ? "" : "disabled"}>← ${prev ? inlineHTML(STATION_BY_ID.get(prev.id).title) : "…"}</button>
+      <button data-nav="next" ${next ? "" : "disabled"}>${next ? inlineHTML(STATION_BY_ID.get(next.id).title) : "Finish"} →</button>
     </div>
   </div>`;
 }
@@ -699,7 +707,6 @@ document.addEventListener("click", e => {
   const chip = e.target.closest(".chip");
   if (chip) { openStation(chip.dataset.id, { scroll: true }); return; }
   if (e.target.closest("#startBtn")) { startTour(); return; }
-  if (e.target.closest("#resetBtn")) { resetProgress(); return; }
   if (e.target.closest(".xchip")) {
     const sym = e.target.dataset.sym;
     const own = resolveSymbol(sym);
@@ -732,23 +739,9 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") closeStation();
 });
 
-/* entry pill */
+/* entry pill: opens the first station and scrolls to it (approved shell) */
 function startTour() {
-  const first = prog.last && STATION_BY_ID.has(prog.last) ? prog.last : ROUTE[0].id;
-  openStation(first, { scroll: true });
-  startBtn.textContent = "▶ Resume tour";
-  resetBtn.hidden = false;
-}
-function resetProgress() {
-  prog.visited = []; prog.last = null;
-  saveProgress(prog);
-  startBtn.textContent = "▶ Start tour";
-  resetBtn.hidden = true;
-  paintStepper();
-}
-function paintProgressUI() {
-  startBtn.textContent = prog.visited.length ? "▶ Resume tour" : "▶ Start tour";
-  resetBtn.hidden = !prog.visited.length;
+  openStation(ROUTE[0].id, { scroll: true });
 }
 
 /* ============================ self-check UI ============================ */
@@ -800,7 +793,6 @@ fileEl.addEventListener("scroll", () => {
 
 runChecks();
 renderBadge();
-paintProgressUI();
 paintStepper();
 restoreScroll();
 queueSpy();
@@ -817,6 +809,10 @@ if (new URLSearchParams(location.search).has("selftest")) renderCheckModal();
 /* ============================ deep selftest (?selftest=1) ============================ */
 const tick = () => new Promise(r => setTimeout(r, 60));
 async function deepSelfTest() {
+  /* The test clicks through stations and marks them visited; snapshot the
+     user's real progress first and restore it at the end, so ?selftest=1
+     never touches saved tour state. */
+  const saved = loadProgress();
   await tick();
   report("dom.lines", fileEl.querySelectorAll(".fl-line").length === 1320,
     fileEl.querySelectorAll(".fl-line").length + " line elements rendered");
@@ -835,12 +831,15 @@ async function deepSelfTest() {
     "clicking line " + STATION_BY_ID.get("36").range[0] + " opens “" +
     bubbleEl.querySelector("h2").textContent.trim() + "”");
 
-  /* predict reveal */
+  /* predict reveal — and the Predict marker is rendered exactly once */
   const st38 = STATION_BY_ID.get("38");
   lineEls[st38.range[0]].click(); await tick();
   const pred = bubbleEl.querySelector(".b-pred");
+  const qText = pred.querySelector(".q").textContent;
   const revBtn = pred.querySelector(".rev");
   revBtn.click(); await tick();
+  report("dom.predict-label", /^Predict — /.test(qText) && !qText.includes("Predict — Predict"),
+    "the Predict marker renders once: “" + qText.slice(0, 48) + "…”");
   report("dom.reveal", !pred.querySelector(".a").classList.contains("hidden"),
     "the Reveal button shows the answer");
 
@@ -857,8 +856,7 @@ async function deepSelfTest() {
   bubbleEl.querySelector("#bubbleClose").click(); await tick();
   report("dom.close", bubbleEl.hidden, "the × button closes the bubble");
 
-  /* start pill opens route[0] (station 02) — with no saved progress */
-  resetProgress();
+  /* start pill opens route[0] (station 02), whatever the saved progress */
   startBtn.click(); await tick();
   report("dom.start", state.open === "02", "Start tour opens route[0] (“" +
     bubbleEl.querySelector("h2").textContent.trim().slice(0, 40) + "…”)");
@@ -871,6 +869,11 @@ async function deepSelfTest() {
   report("dom.progress", p.visited.length === 2 && p.last === "36",
     "progress save/load round-trip works");
 
+  /* restore the user's progress and close the bubble the test left open */
+  prog.visited = saved.visited; prog.last = saved.last;
+  saveProgress(prog);
+  closeStation();
+  paintStepper();
   renderBadge();
   renderCheckModal();
 }

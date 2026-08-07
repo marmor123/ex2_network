@@ -87,11 +87,6 @@ body.content-fail #file-line { outline: 1px solid #f87171; }
   white-space: nowrap; box-shadow: 0 4px 18px rgba(56,189,248,.3);
 }
 #startBtn:hover { filter: brightness(1.1); }
-#resetBtn {
-  background: none; border: none; color: var(--dim); font-size: 11px;
-  cursor: pointer; padding: 2px 6px; text-decoration: underline dotted;
-}
-#resetBtn:hover { color: var(--pink); }
 #track {
   flex: 1; min-width: 0; height: 100%;
   display: flex; align-items: center; gap: 0;
