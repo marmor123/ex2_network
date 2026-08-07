@@ -4,15 +4,15 @@ Authoring deliverable for wayfinder tickets **#25–#28**. One markdown-ish file
 
 ## Naming and location
 
-`docs/tour/stations/NN-slug.md` — `NN` is the partition table's station number (01–52), `slug` a short dash-slug. The partition doc (`docs/tour/partition.md`) is the authority on titles, types, tags, and line ranges.
+`docs/tour/stations/NN-slug.md` — `NN` is the partition table's station number (01–52), `slug` a short dash-slug. The partition doc (`docs/tour/partition.md`) is the authority on titles, types, tags, and line ranges. The capstone is the one exception: it owns no lines (partition Q1), so it is `capstone.md` with `lines: none` — the build's no-anchor station.
 
 ## Header
 
 First line: the station title, verbatim from the partition table. Then three front-matter-ish lines:
 
-- `type:` — one of `file`, `constant`, `struct`, `function` (partition §2).
+- `type:` — one of `file`, `constant`, `struct`, `function`, plus `content` for the capstone (owns no lines).
 - `tags:` — comma-separated chapter tags from the canonical nine: `orientation, types, handshake, setup, control, data-path, measurement, main, closing`.
-- `lines:` — the owned line range `start-end` per the partition (pinned `bw.c` blob `8db1861`).
+- `lines:` — the owned line range `start-end` per the partition (pinned `bw.c` blob `8db1861`); `none` for the capstone.
 - `skip: yes` — only where the partition marks an expert-escape skip station (station 1); the lead carries the affordance text.
 
 ## Body blocks
