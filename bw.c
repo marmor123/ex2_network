@@ -6,8 +6,8 @@
  * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
  * ex1's converged counts table. Per size a warmup batch rides the same
  * windowed stream ahead of the timed batch, then the timed batch of RDMA
- * WRITEs: K WRs posted per ibv_post_send as a linked list (W=256, K=64
- * by default), only the K-th WR of the stream signaled — one CQE per K
+ * WRITEs: K WRs posted per ibv_post_send as a linked list (W=256, K=64,
+ * fixed — no options), only the K-th WR of the stream signaled — one CQE per K
  * WRs, so completions are accounted in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
  * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
@@ -48,7 +48,6 @@
 #include <sys/socket.h>
 #include <sys/param.h>
 #include <sys/time.h>
-#include <getopt.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
@@ -112,8 +111,20 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
  * full. K is bounded by QP_SLACK for the same reason. */
 #define QP_SLACK 1024
 
-#define WINDOW_DEFAULT 256
-#define SIGNAL_INTERVAL_DEFAULT 64
+/* The run's fixed configuration — the option-era -r/-k/-p/-i are gone:
+ * window depth W (the refill reclaims once W data WRs are outstanding),
+ * signal interval K (only the K-th WR of the stream is signaled), and the
+ * TCP handshake port. */
+#define WINDOW 256
+#define SIGNAL_INTERVAL 64
+#define HANDSHAKE_PORT 18515
+
+/* K ≤ W and K ≤ QP_SLACK, so the refill's guarantee holds — after the last
+ * batch at most W - 1 + K ≤ sq_depth - 1 WRs are outstanding, so the done
+ * SEND always finds a free SQ slot. The option-era runtime guard is gone;
+ * the fixed constants make the check provable at compile time. */
+typedef char bw_params_sane[(SIGNAL_INTERVAL <= WINDOW) &&
+                            (SIGNAL_INTERVAL <= QP_SLACK) ? 1 : -1];
 
 /* The largest max_inline_data tried at QP creation. mlx4 — the course
  * hardware — rejects QP creation when the declared value exceeds what its
@@ -503,7 +514,7 @@ out:
 }
 
 static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
-                                      int window, int is_server)
+                                      int is_server)
 {
     struct bw_context *ctx;
     struct ibv_device_attr dev_attr;
@@ -541,7 +552,7 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         fprintf(stderr, "Couldn't query device attributes\n");
         return NULL;
     }
-    max_send_wr = window + QP_SLACK;
+    max_send_wr = WINDOW + QP_SLACK;
     max_recv_wr = CTRL_POOL_DEPTH;
     if (max_send_wr > (uint32_t) dev_attr.max_qp_wr)
         max_send_wr = dev_attr.max_qp_wr;
@@ -832,11 +843,10 @@ struct bw_data_state {
  * the data path only data WRITE completions may be pending here, so
  * anything else is a protocol error; a poll returning 0 only means the
  * last WQEs are still in flight, so the poll is retried. */
-static int bw_refill(struct bw_context *ctx, uint64_t window, uint64_t k,
-                     struct bw_data_state *st)
+static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 {
-    while (st->outstanding >= window ||
-           st->outstanding + k >= (uint64_t) ctx->sq_depth) {
+    while (st->outstanding >= WINDOW ||
+           st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
@@ -849,7 +859,7 @@ static int bw_refill(struct bw_context *ctx, uint64_t window, uint64_t k,
 
         if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
             return 1;
-        st->outstanding -= k;
+        st->outstanding -= SIGNAL_INTERVAL;
     }
     return 0;
 }
@@ -857,7 +867,7 @@ static int bw_refill(struct bw_context *ctx, uint64_t window, uint64_t k,
 /* Post `n` RDMA WRITEs of `size` bytes into the server's registered
  * buffer, as a stream of K-WR linked lists, one per ibv_post_send (the
  * last list takes the remainder). Signal schedule: the K-th WR of the
- * size's stream (t % k == 0) and the stream's final WR — mid-stream
+ * size's stream (t % K == 0) and the stream's final WR — mid-stream
  * lists therefore yield one CQE per K WRs, while the warmup residual and
  * the final remainder are accounted exactly (in-order RC). Messages ≤
  * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
@@ -865,8 +875,7 @@ static int bw_refill(struct bw_context *ctx, uint64_t window, uint64_t k,
  * reused for every list. `final` marks the call that posts the stream's
  * last list (the timed one). */
 static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
-                          size_t size, uint64_t n, uint64_t window,
-                          uint64_t k, struct ibv_send_wr *wrs,
+                          size_t size, uint64_t n, struct ibv_send_wr *wrs,
                           struct ibv_sge *sges, struct bw_data_state *st,
                           int final)
 {
@@ -874,17 +883,18 @@ static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
             size <= ctx->max_inline_data ? IBV_SEND_INLINE : 0;
 
     while (n > 0) {
-        uint64_t chunk = n < k ? n : k;
+        uint64_t chunk = n < SIGNAL_INTERVAL ? n : SIGNAL_INTERVAL;
         struct ibv_send_wr *bad_wr;
         uint64_t i;
 
-        if (bw_refill(ctx, window, k, st))
+        if (bw_refill(ctx, st))
             return 1;
 
         for (i = 0; i < chunk; ++i) {
             uint64_t t = st->posted + i + 1; /* this WR's position in the stream */
             uint32_t signal =
-                    (t % k == 0) || (final && n == chunk && i == chunk - 1);
+                    (t % SIGNAL_INTERVAL == 0) ||
+                    (final && n == chunk && i == chunk - 1);
 
             sges[i] = (struct ibv_sge) {
                     .addr	= (uint64_t) ctx->buf,
@@ -938,10 +948,8 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
  * the refill leaves at most W - 1 + K ≤ sq_depth - 1 WRs outstanding
  * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
  * passes the data and done-send completions through; the 21 acks consume
- * 21 of the 32 pre-posted control receive pool, never refreshed.
- * count_override (-n) replaces the timed count of every size. */
-static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
-                           uint64_t window, uint64_t k, uint64_t count_override)
+ * 21 of the 32 pre-posted control receive pool, never refreshed. */
+static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
     struct ibv_send_wr *wrs;
@@ -949,8 +957,8 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
     uint32_t seq;
     int rc = 1;
 
-    wrs = calloc(k, sizeof *wrs);
-    sges = calloc(k, sizeof *sges);
+    wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
+    sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
     if (!wrs || !sges) {
         fprintf(stderr, "Couldn't allocate data batch\n");
         goto out;
@@ -958,20 +966,19 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest,
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
-        uint64_t count = count_override ? count_override : MSG_COUNTS[seq];
+        uint64_t count = MSG_COUNTS[seq];
         struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
         struct bw_data_state st = { 0, 0 };
 
         if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq],
-                           window, k, wrs, sges, &st, 0))
+                           wrs, sges, &st, 0))
             goto out;
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (bw_post_writes(ctx, dest, size, count,
-                           window, k, wrs, sges, &st, 1))
+        if (bw_post_writes(ctx, dest, size, count, wrs, sges, &st, 1))
             goto out;
 
         if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
@@ -1063,19 +1070,6 @@ static void usage(const char *argv0)
     printf("Usage:\n");
     printf("  %s            start a server and wait for connection\n", argv0);
     printf("  %s <host>     connect to server at <host>\n", argv0);
-    printf("\n");
-    printf("Options:\n");
-    printf("  -p, --port=<port>      handshake port (default 18515)\n");
-    printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
-    printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-    printf("  -r, --window=<depth>   window depth W: refill reclaims once W data WRs\n");
-    printf("                      are outstanding (default %d)\n", WINDOW_DEFAULT);
-    printf("  -k, --signal-interval=<k>  signal every k-th data WR (default %d,\n",
-           SIGNAL_INTERVAL_DEFAULT);
-    printf("                      max min(window, %d))\n", QP_SLACK);
-    printf("  -n, --count=<n>      override the timed-batch count of every size\n");
-    printf("                      (smoke-test the protocol with tiny batches)\n");
-    printf("  -g, --gid-idx=<index>  local port gid index (default: LID-based)\n");
 }
 
 int main(int argc, char *argv[])
@@ -1085,101 +1079,16 @@ int main(int argc, char *argv[])
     struct bw_context       *ctx;
     struct bw_dest          my_dest;
     struct bw_dest         *rem_dest;
-    char                    *ib_devname = NULL;
     char                    *servername = NULL;
-    int                      port = 18515; /* matches usage() */
-    int                      ib_port = 1;
-    int                      window = WINDOW_DEFAULT;
-    int                      k = SIGNAL_INTERVAL_DEFAULT;
-    uint64_t                 count_override = 0;
-    int                      gidx = -1;
 
     srand48(getpid() * time(NULL));
 
-    while (1) {
-        int c;
-
-        static struct option long_options[] = {
-                { .name = "port",     .has_arg = 1, .val = 'p' },
-                { .name = "ib-dev",   .has_arg = 1, .val = 'd' },
-                { .name = "ib-port",  .has_arg = 1, .val = 'i' },
-                { .name = "window",   .has_arg = 1, .val = 'r' },
-                { .name = "signal-interval", .has_arg = 1, .val = 'k' },
-                { .name = "count",    .has_arg = 1, .val = 'n' },
-                { .name = "gid-idx",  .has_arg = 1, .val = 'g' },
-                { 0 }
-        };
-
-        c = getopt_long(argc, argv, "p:d:i:r:k:n:g:", long_options, NULL);
-        if (c == -1)
-            break;
-
-        switch (c) {
-        case 'p':
-            port = strtol(optarg, NULL, 0);
-            if (port < 0 || port > 65535) {
-                usage(argv[0]);
-                return 1;
-            }
-            break;
-
-        case 'd':
-            ib_devname = strdup(optarg);
-            break;
-
-        case 'i':
-            ib_port = strtol(optarg, NULL, 0);
-            if (ib_port < 0) {
-                usage(argv[0]);
-                return 1;
-            }
-            break;
-
-        case 'r':
-            window = strtol(optarg, NULL, 0);
-            if (window <= 0) {
-                usage(argv[0]);
-                return 1;
-            }
-            break;
-
-        case 'k':
-            k = strtol(optarg, NULL, 0);
-            if (k < 1) {
-                usage(argv[0]);
-                return 1;
-            }
-            break;
-
-        case 'n':
-            count_override = strtoull(optarg, NULL, 0);
-            if (count_override < 1) {
-                usage(argv[0]);
-                return 1;
-            }
-            break;
-
-        case 'g':
-            gidx = strtol(optarg, NULL, 0);
-            break;
-
-        default:
-            usage(argv[0]);
-            return 1;
-        }
-    }
-
-    if (optind == argc - 1)
-        servername = strdup(argv[optind]);
-    else if (optind < argc) {
-        usage(argv[0]);
-        return 1;
-    }
-
-    /* K is bounded by the window and the slack so the refill's guarantee
-     * holds — after the last batch at most W - 1 + K ≤ sq_depth - 1 WRs
-     * are outstanding, so the done SEND always finds a free SQ slot. */
-    if (k > window || k > QP_SLACK) {
+    /* The only interface: no hostname starts a server, one hostname or IP
+     * connects to it. Everything else — W, K, the handshake port, the
+     * device — is fixed at compile time. */
+    if (argc == 2)
+        servername = strdup(argv[1]);
+    else if (argc > 2) {
         usage(argv[0]);
         return 1;
     }
@@ -1192,25 +1101,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (!ib_devname) {
-        ib_dev = *dev_list;
-        if (!ib_dev) {
-            fprintf(stderr, "No IB devices found\n");
-            return 1;
-        }
-    } else {
-        int i;
-        for (i = 0; dev_list[i]; ++i)
-            if (!strcmp(ibv_get_device_name(dev_list[i]), ib_devname))
-                break;
-        ib_dev = dev_list[i];
-        if (!ib_dev) {
-            fprintf(stderr, "IB device %s not found\n", ib_devname);
-            return 1;
-        }
+    /* The first device found — the option-era -d selection is gone. */
+    ib_dev = *dev_list;
+    if (!ib_dev) {
+        fprintf(stderr, "No IB devices found\n");
+        return 1;
     }
 
-    ctx = bw_init_ctx(ib_dev, ib_port, window, !servername);
+    ctx = bw_init_ctx(ib_dev, IB_PORT, !servername);
     if (!ctx)
         return 1;
 
@@ -1221,7 +1119,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (ibv_query_port(ctx->context, ib_port, &ctx->portinfo)) {
+    if (ibv_query_port(ctx->context, IB_PORT, &ctx->portinfo)) {
         fprintf(stderr, "Couldn't get port info\n");
         return 1;
     }
@@ -1232,13 +1130,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (gidx >= 0) {
-        if (ibv_query_gid(ctx->context, ib_port, gidx, &my_dest.gid)) {
-            fprintf(stderr, "Could not get local gid for gid index %d\n", gidx);
-            return 1;
-        }
-    } else
-        memset(&my_dest.gid, 0, sizeof my_dest.gid);
+    /* LID-based addressing (the option-era -g is gone): the local GID stays
+     * all-zero, so the GRH path in bw_connect_qp never engages — the course
+     * fabric's normal mode. */
+    memset(&my_dest.gid, 0, sizeof my_dest.gid);
 
     my_dest.qpn = ctx->qp->qp_num;
     my_dest.psn = lrand48() & 0xffffff;
@@ -1246,30 +1141,29 @@ int main(int argc, char *argv[])
     /* The path MTU comes from the port's active MTU, so large messages use
      * the largest packets the link allows. */
     if (servername)
-        rem_dest = bw_exch_dest_client(servername, port, &my_dest);
+        rem_dest = bw_exch_dest_client(servername, HANDSHAKE_PORT, &my_dest);
     else {
         /* The server advertises its buffer — the client's RDMA WRITEs land
          * here — and nothing else beyond the template's QP address. */
         my_dest.buf_addr = (uint64_t) ctx->buf;
         my_dest.rkey = ctx->mr->rkey;
-        rem_dest = bw_exch_dest_server(ctx, ib_port, ctx->portinfo.active_mtu,
-                                       port, &my_dest, gidx);
+        rem_dest = bw_exch_dest_server(ctx, IB_PORT, ctx->portinfo.active_mtu,
+                                       HANDSHAKE_PORT, &my_dest, -1);
     }
 
     if (!rem_dest)
         return 1;
 
     if (servername)
-        if (bw_connect_qp(ctx, ib_port, my_dest.psn, ctx->portinfo.active_mtu,
-                          rem_dest, gidx))
+        if (bw_connect_qp(ctx, IB_PORT, my_dest.psn, ctx->portinfo.active_mtu,
+                          rem_dest, -1))
             return 1;
 
     /* The full sweep: the client streams the WRITEs of each size and
      * drives one done SEND per size, the server acks each. Both sides
      * verify every sequence counter. */
     if (servername) {
-        if (bw_client_bench(ctx, rem_dest, (uint64_t) window, (uint64_t) k,
-                            count_override))
+        if (bw_client_bench(ctx, rem_dest))
             return 1;
     } else {
         if (bw_server_ctrl_exchange(ctx))

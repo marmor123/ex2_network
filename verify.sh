@@ -13,39 +13,33 @@
 # PASS/FAIL report is printed — paste it back into the dev session.
 # This script is a dev workflow tool; it is NOT part of the submission archive.
 #
-# Stage 6 (current): hardware validation & parameter tuning (issue #7).
-# The campaign is 9 full sweeps: 3 with the default parameters (W=256, K=64)
-# and 2 each of the alternatives (512,64), (256,128), (512,128). The server
-# runs one instance per sweep; the client retries connect until the server
-# instance is up, so the two scripts need not start at exactly the same time.
+# Stage 6 (current): hardware validation on the fixed parameters (issue #7).
+# The -r/-k options are gone — bw.c bakes W=256, K=64 in (the tuning campaign
+# agreed with the defaults, ADR-0006/0007) — so the campaign is 3 full sweeps
+# with the fixed parameters. The server runs one instance per sweep; the
+# client retries connect until the server instance is up, so the two scripts
+# need not start at exactly the same time.
 #   [6.1] make builds server + client (symlink) with zero warnings
 #         (-O3 -Wall -Wextra, from a clean tree); client symlink to server
 #   [6.2] client role only: ./client 127.0.0.1 with no server listening
 #         exits non-zero, prints nothing (stdout and stderr), no hang
-#   [6.3] both roles: all 9 sweeps run — per sweep, exit 0 and the client's
+#   [6.3] both roles: all 3 sweeps run — per sweep, exit 0 and the client's
 #         output is exactly the 21-line ex1 contract `size\t%.2f\tunit`
 #         (sizes 2^0..2^20 ascending), nothing on stderr. A QP error on
 #         either side fails its sweep here: bad completions print to stderr
 #         and exit non-zero.
-#   [6.4] client role only: variance across the 3 default-parameter sweeps
-#         at the large sizes (64 KB and 1 MB) < 1% (coefficient of
-#         variation) — the acceptance criterion ">= 3 full sweeps with
-#         <1% variance at the large sizes"
+#   [6.4] client role only: variance across the 3 sweeps at the large sizes
+#         (64 KB and 1 MB) < 1% (coefficient of variation) — the acceptance
+#         criterion ">= 3 full sweeps with <1% variance at the large sizes"
 #   [6.5] client role only: message-rate-bound scaling — in every sweep,
 #         each size 1..32 B doubles throughput within +/-10% (the 5
 #         doublings 2^0..2^5), the expected small-size regime
-#   [6.6] client role only: the default-parameter envelope holds the
-#         measured floors (ADR-0004/0005: 256 B and 1 KB >= 5.76 Gbps, the
-#         inline plateau; 64 KB and 1 MB >= 34.2 Gbps, the DMA envelope),
+#   [6.6] client role only: the fixed-parameter envelope holds the measured
+#         floors (ADR-0004/0005: 256 B and 1 KB >= 5.76 Gbps, the inline
+#         plateau; 64 KB and 1 MB >= 34.2 Gbps, the DMA envelope),
 #         1 MB >= 100x 1 B, peak never above the 56 Gb/s link rate
-#   [6.7] client role only: parameter A/B — no alternative parameter set
-#         beats the default's mean at any of the six anchor sizes (1 B,
-#         32 B, 256 B, 1 KB, 64 KB, 1 MB) by >= 1%. If one does, the
-#         hardware disagrees with the assumed 256/64 and the dev session
-#         re-tunes the defaults from these numbers.
-#   [6.8] client role only: the record — per-set anchor table and the
-#         per-size mean/CV table of the default sweeps (the measured
-#         envelope for ADR-0006)
+#   [6.7] client role only: the record — the per-size mean/CV table of the
+#         sweeps (the measured envelope for ADR-0006)
 #
 # The sweep outputs are kept in a temp dir whose path is printed, so
 # individual sweeps can be re-inspected or re-pasted after the fact.
@@ -159,16 +153,10 @@ for arg in "$@"; do
     esac
 done
 
-# The campaign: 3 default sweeps then 2 per alternative set, in this order.
-# W and K are client-side; the server runs one instance per sweep, identical
-# each time (its flags stay at the defaults).
-NSWEEPS=9
-NSWEEPS_DEFAULT=3
-NSWEEPS_ALT=2
-SETS=("256:64" "256:64" "256:64"
-      "512:64" "512:64"
-      "256:128" "256:128"
-      "512:128" "512:128")
+# The campaign: 3 sweeps with the fixed parameters (W=256, K=64 — baked in,
+# the option-era -r/-k are gone). The server runs one instance per sweep,
+# identical each time.
+NSWEEPS=3
 # Six anchor sizes cover the three regimes (ADR-0004): 1 B/32 B message-rate,
 # 256 B/1 KB inline plateau, 64 KB/1 MB DMA envelope. Parallel arrays (the
 # labels contain spaces, so a word-splitting list would tear them apart).
@@ -181,8 +169,7 @@ fail=0
 echo "=== Lab #2 verify: stage $stage ($role side)$([ "$final" = 1 ] && echo ' — FINAL CAMPAIGN') ==="
 [ "$role" = client ] && echo "    peer: $peer"
 if [ "$role" = client ]; then
-    echo "    campaign: $NSWEEPS sweeps — $NSWEEPS_DEFAULT default (W=256, K=64)"
-    echo "      + $NSWEEPS_ALT each of (512,64), (256,128), (512,128)"
+    echo "    campaign: $NSWEEPS sweeps (W=256, K=64, fixed)"
 fi
 
 # --- [6.1] Build gate (both roles) ------------------------------------------
@@ -221,9 +208,9 @@ fi
 #
 # Server side: one `./server` instance per sweep, in order. Each instance
 # exits 0 only after all 21 dones and the teardown beat, printing nothing.
-# Client side: one `./client` per sweep with the set's W/K flags (the default
-# set gets no flags). The client retries connect until the server instance
-# for this sweep is up — the pair's scripts may drift by seconds.
+# Client side: one `./client` per sweep — the parameters are baked in. The
+# client retries connect until the server instance for this sweep is up —
+# the pair's scripts may drift by seconds.
 
 if [ "$role" = server ]; then
     for i in $(seq 1 $NSWEEPS); do
@@ -243,7 +230,6 @@ else
     dir=$(mktemp -d)
     echo "    sweep outputs: $dir (re-paste from there if asked)"
     for i in $(seq 1 $NSWEEPS); do
-        set=${SETS[$((i - 1))]}
         out="$dir/sweep.$i.out"
         err="$dir/sweep.$i.err"
         rcfile="$dir/sweep.$i.rc"
@@ -251,12 +237,7 @@ else
         # The first attempts usually connect instantly; the retry covers the
         # server-side script starting late or its instance cycling.
         for attempt in $(seq 1 60); do
-            if [ "$set" = "256:64" ]; then
-                timeout 180 ./client "$peer" >"$out" 2>"$err"
-            else
-                timeout 180 ./client -r "${set%:*}" -k "${set#*:}" \
-                    "$peer" >"$out" 2>"$err"
-            fi
+            timeout 180 ./client "$peer" >"$out" 2>"$err"
             rc=$?
             [ "$rc" -eq 0 ] && break
             # A QP error prints to stderr and must fail this sweep (the
@@ -270,9 +251,9 @@ else
         detail=$(contract_detail "$out")
         err_txt=$(cat "$err")
         if [ "$rc" -eq 0 ] && [ "$detail" = ok ] && [ -z "$err_txt" ]; then
-            report "sweep $i/$NSWEEPS (W=${set%:*}, K=${set#*:}): contract OK" PASS
+            report "sweep $i/$NSWEEPS (W=256, K=64): contract OK" PASS
         else
-            report "sweep $i/$NSWEEPS (W=${set%:*}, K=${set#*:}): contract OK" FAIL \
+            report "sweep $i/$NSWEEPS (W=256, K=64): contract OK" FAIL \
                    "rc=$rc contract='$detail' stderr='$(echo "$err_txt" | head -2)'"
         fi
     done
@@ -280,35 +261,19 @@ else
     # The analyses below use only the sweeps that actually produced a valid
     # 21-line contract — a failed sweep is reported above and must not leak
     # garbage into the statistics. The acceptance criteria need 3 valid
-    # default sweeps; the A/B needs at least 2 per set.
+    # sweeps.
     valid_defaults=()
-    valid_alts=("" "" "")   # one entry per alternative set
     for i in $(seq 1 $NSWEEPS); do
-        set=${SETS[$((i - 1))]}
         if sweep_valid "$dir/sweep.$i.rc" "$dir/sweep.$i.out"; then
-            case "$set" in
-                256:64) valid_defaults+=("$dir/sweep.$i.out") ;;
-                512:64)  valid_alts[0]+="$dir/sweep.$i.out " ;;
-                256:128) valid_alts[1]+="$dir/sweep.$i.out " ;;
-                512:128) valid_alts[2]+="$dir/sweep.$i.out " ;;
-            esac
+            valid_defaults+=("$dir/sweep.$i.out")
         fi
     done
-    for j in 0 1 2; do
-        valid_alts[$j]=${valid_alts[$j]% }
-    done
-    alt_labels=("512/64" "256/128" "512/128")
     ndef=${#valid_defaults[@]}
-    n_alt=(0 0 0)
-    for j in 0 1 2; do
-        set -- ${valid_alts[$j]}
-        n_alt[$j]=$#
-    done
-    echo "    valid sweeps: $ndef default, ${n_alt[0]} + ${n_alt[1]} + ${n_alt[2]} alternative"
+    echo "    valid sweeps: $ndef"
     if [ "$ndef" -ge 3 ]; then
-        report "3 valid default-parameter sweeps" PASS
+        report "3 valid sweeps" PASS
     else
-        report "3 valid default-parameter sweeps" FAIL \
+        report "3 valid sweeps" FAIL \
                "only $ndef valid — rerun the campaign (see per-sweep failures above)"
     fi
 
@@ -336,17 +301,16 @@ else
     # --- [6.5] Message-rate-bound scaling, every sweep ----------------------
 
     for i in $(seq 1 $NSWEEPS); do
-        set=${SETS[$((i - 1))]}
         if sweep_valid "$dir/sweep.$i.rc" "$dir/sweep.$i.out"; then
             d=$(scaling_1to32 "$dir/sweep.$i.out")
             if [ "$d" = ok ]; then
-                report "sweep $i (W=${set%:*}, K=${set#*:}): 1..32 B doubles throughput" PASS
+                report "sweep $i (W=256, K=64): 1..32 B doubles throughput" PASS
             else
-                report "sweep $i (W=${set%:*}, K=${set#*:}): 1..32 B doubles throughput" FAIL \
+                report "sweep $i (W=256, K=64): 1..32 B doubles throughput" FAIL \
                        "$d — not message-rate-bound?"
             fi
         else
-            report "sweep $i (W=${set%:*}, K=${set#*:}): 1..32 B doubles throughput" FAIL \
+            report "sweep $i (W=256, K=64): 1..32 B doubles throughput" FAIL \
                    "sweep invalid — see [6.3]"
         fi
     done
@@ -390,66 +354,10 @@ else
                "no statistics — see above"
     fi
 
-    # --- [6.7] Parameter A/B: does the hardware agree with 256/64? ----------
+    # --- [6.7] The record: the per-size envelope -----------------------------
 
     if [ "$ndef" -ge 3 ]; then
-        alt_beats=""
-        untested=""
-        for j in 0 1 2; do
-            if [ "${n_alt[$j]}" -lt 2 ]; then
-                untested="$untested ${alt_labels[$j]}(only ${n_alt[$j]} valid)"
-                continue
-            fi
-            for ai in "${!ANCHOR_LINES[@]}"; do
-                line=${ANCHOR_LINES[$ai]}
-                label=${ANCHOR_LABELS[$ai]}
-                set -- $(cv_at "$line" "${valid_defaults[@]}")
-                dmean=$1
-                set -- $(cv_at "$line" ${valid_alts[$j]})
-                amean=$1
-                if awk -v d="$dmean" -v a="$amean" 'BEGIN { exit !(a > d * 1.01) }'; then
-                    alt_beats="$alt_beats $label(${alt_labels[$j]}) def=$dmean alt=$amean"
-                fi
-            done
-        done
-        if [ -n "$untested" ]; then
-            report "no alternative beats default (W=256, K=64) by >= 1%" FAIL \
-                   "not fully tested:$untested — rerun the campaign"
-        elif [ -z "$alt_beats" ]; then
-            report "no alternative beats default (W=256, K=64) by >= 1%" PASS \
-                   "defaults confirmed on this pair"
-        else
-            report "no alternative beats default (W=256, K=64) by >= 1%" FAIL \
-                   "hardware disagrees with 256/64:$alt_beats"
-        fi
-    else
-        report "no alternative beats default (W=256, K=64) by >= 1%" FAIL \
-               "no statistics — see above"
-    fi
-
-    # --- [6.8] The record: anchor table and per-size envelope ----------------
-
-    if [ "$ndef" -ge 3 ]; then
-        printf '             --- anchor table (Gbps means) ---\n'
-        printf '             %-10s %-18s %-14s %-14s %-14s\n' \
-               anchor "default(n=$ndef)" "512/64" "256/128" "512/128"
-        for ai in "${!ANCHOR_LINES[@]}"; do
-            line=${ANCHOR_LINES[$ai]}
-            label=${ANCHOR_LABELS[$ai]}
-            set -- $(cv_at "$line" "${valid_defaults[@]}")
-            printf '             %-10s %-18s' "$label" "$1"
-            for j in 0 1 2; do
-                if [ "${n_alt[$j]}" -ge 2 ]; then
-                    set -- $(cv_at "$line" ${valid_alts[$j]})
-                    printf ' %-14s' "$1"
-                else
-                    printf ' %-14s' "-"
-                fi
-            done
-            printf '\n'
-        done
-
-        printf '             --- default sweep envelope (mean, CV) ---\n'
+        printf '             --- sweep envelope (mean, CV) ---\n'
         for line in $(seq 1 21); do
             size=$(sed -n "${line}p" "${valid_defaults[0]}" | cut -f1)
             set -- $(cv_at "$line" "${valid_defaults[@]}")
@@ -458,7 +366,7 @@ else
         done
         printf '             ---\n'
     else
-        printf '             --- no record: fewer than 3 valid default sweeps ---\n'
+        printf '             --- no record: fewer than 3 valid sweeps ---\n'
     fi
 fi
 
