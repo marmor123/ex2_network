@@ -821,14 +821,13 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
  * exactly by the signaled final WR (in-order RC). Messages ≤
  * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
  * the registered buffer. `wrs`/`sges` are the caller's K-deep WR arrays,
- * their constant fields preinitialized once at allocation; per size only
- * the changing fields (length, send_flags, next) are rewritten here.
- * `final` marks the call that posts the stream's last list (the timed
- * one). */
-static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
-                          size_t size, uint64_t n, struct ibv_send_wr *wrs,
-                          struct ibv_sge *sges, struct bw_data_state *st,
-                          int final)
+ * whose constant fields — including the RDMA target — were
+ * preinitialized once at allocation; per size only the changing fields
+ * (length, send_flags, next) are rewritten here. `final` marks the call
+ * that posts the stream's last list (the timed one). */
+static int bw_post_writes(struct bw_context *ctx, size_t size, uint64_t n,
+                          struct ibv_send_wr *wrs, struct ibv_sge *sges,
+                          struct bw_data_state *st, int final)
 {
     uint32_t inline_flag =
     (size <= 64 && size <= ctx->max_inline_data)
@@ -942,7 +941,7 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (bw_post_writes(ctx, dest, size, count, wrs, sges, &st, 1))
+        if (bw_post_writes(ctx, size, count, wrs, sges, &st, 1))
             goto out;
 
         if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
