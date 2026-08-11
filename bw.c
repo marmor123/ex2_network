@@ -100,28 +100,25 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
  * own timeout fires. */
 #define CTRL_POLL_TIMEOUT_SEC 10
 
-/* The SQ depth is the window (W) plus slack: the slack absorbs the last
- * K-WR list's overshoot of the window (K ≤ QP_SLACK, so the refill leaves
- * at most W - 1 + K ≤ sq_depth - 1 WRs outstanding) plus the per-size
- * done SEND, so neither the last data list nor the done can find the SQ
- * full. K is bounded by QP_SLACK for the same reason. */
-#define QP_SLACK 1024
-
 /* The run's fixed configuration — the option-era -r/-k/-p/-i are gone:
- * window depth W (the refill reclaims once W data WRs are outstanding),
- * signal interval K (only the K-th WR of the stream is signaled), the
- * device's IB port 1, and the TCP handshake port. */
+ * pipe depth W, signal interval K (only the K-th WR of the stream is
+ * signaled), the device's IB port 1, and the TCP handshake port. */
+
+/* The SQ depth is requested as W + K — the pipe depth plus one signal
+ * interval, exactly the deepest the refill lets the SQ get: its single
+ * trigger (outstanding + K ≥ sq_depth) holds the pipe at W outstanding
+ * when the grant matches the request, and at sq_depth - K if the
+ * max_qp_wr clamp cuts the grant short. */
 #define WINDOW 256
 #define SIGNAL_INTERVAL 64
 #define IB_PORT 1
 #define HANDSHAKE_PORT 18515
 
-/* K ≤ W and K ≤ QP_SLACK, so the refill's guarantee holds — after the last
- * batch at most W - 1 + K ≤ sq_depth - 1 WRs are outstanding, so the done
- * SEND always finds a free SQ slot. The option-era runtime guard is gone;
- * the fixed constants make the check provable at compile time. */
-typedef char bw_params_sane[(SIGNAL_INTERVAL <= WINDOW) &&
-                            (SIGNAL_INTERVAL <= QP_SLACK) ? 1 : -1];
+/* K ≤ W keeps the pipe (W outstanding) at least one full K-WR list deep,
+ * so the refill never fires before a complete list is in flight. The
+ * option-era runtime guard is gone; the fixed constants make the check
+ * provable at compile time. */
+typedef char bw_params_sane[SIGNAL_INTERVAL <= WINDOW ? 1 : -1];
 
 /* The largest max_inline_data tried at QP creation. mlx4 — the course
  * hardware — rejects QP creation when the declared value exceeds what its
@@ -487,8 +484,6 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         return NULL;
     }
 
-    memset(ctx->buf, 0x7b + is_server, BUFFER_SIZE);
-
     ctx->ctrl_buf = malloc(CTRL_MSG_LEN);
     if (!ctx->ctrl_buf) {
         fprintf(stderr, "Couldn't allocate control buf.\n");
@@ -508,7 +503,7 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         fprintf(stderr, "Couldn't query device attributes\n");
         return NULL;
     }
-    max_send_wr = WINDOW + QP_SLACK;
+    max_send_wr = WINDOW + SIGNAL_INTERVAL;
     max_recv_wr = CTRL_POOL_DEPTH;
     if (max_send_wr > (uint32_t) dev_attr.max_qp_wr)
         max_send_wr = dev_attr.max_qp_wr;
@@ -785,23 +780,23 @@ struct bw_data_state {
     uint64_t outstanding;
 };
 
-/* Refill-never-empty (ADR-0002): while the window is full, reclaim only
- * the CQEs that are ready — each data CQE accounts for exactly K WRs,
- * because only the K-th WR of the stream is signaled and RC completions
- * are in-order — then return immediately so the caller reposts; the SQ
- * never empties and the NIC never idles. The second loop condition is
- * the device-clamped corner: when the SQ was created shallower than
- * W + K (the max_qp_wr clamp in bw_init_ctx), it keeps room for the next
- * K-WR list. The final list's CQE is never reclaimed here: no list is
- * posted after it, so the refill cannot run again; that CQE stays in the
- * CQ for the ack wait to consume (it precedes the ack, ADR-0003). During
- * the data path only data WRITE completions may be pending here, so
- * anything else is a protocol error; a poll returning 0 only means the
- * last WQEs are still in flight, so the poll is retried. */
+/* Refill-never-empty (ADR-0002): once the SQ is as deep as it can be,
+ * reclaim only the CQEs that are ready — each data CQE accounts for
+ * exactly K WRs, because only the K-th WR of the stream is signaled and
+ * RC completions are in-order — then return immediately so the caller
+ * reposts; the SQ never empties and the NIC never idles. The single
+ * trigger is the SQ depth itself: with the SQ sized W + K (bw_init_ctx),
+ * waiting while outstanding + K ≥ sq_depth holds the pipe at W
+ * outstanding, and at sq_depth - K if the max_qp_wr clamp granted less.
+ * The final list's CQE is never reclaimed here: no list is posted after
+ * it, so the refill cannot run again; that CQE stays in the CQ for the
+ * ack wait to consume (it precedes the ack, ADR-0003). During the data
+ * path only data WRITE completions may be pending here, so anything else
+ * is a protocol error; a poll returning 0 only means the last WQEs are
+ * still in flight, so the poll is retried. */
 static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 {
-    while (st->outstanding >= WINDOW ||
-           st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
+    while (st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
@@ -898,11 +893,12 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
 
 /* Client side of the full sweep: per size, the clock starts at the first
  * timed post and stops at the ack-receive completion (ADR-0003) — closed
- * by the done SEND. The done needs one free SQ slot:
- * the refill leaves at most W - 1 + K ≤ sq_depth - 1 WRs outstanding
- * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
- * passes the data and done-send completions through; the 21 acks consume
- * 21 of the 32 pre-posted control receive pool, never refreshed. */
+ * by the done SEND. The done needs one free SQ slot: the refill exits
+ * with at most sq_depth - K - 1 WRs outstanding and the final list adds
+ * at most K, so at most sq_depth - 1 — the slot is always free. The ack
+ * wait passes the data and done-send completions through; the 21 acks
+ * consume 21 of the 32 pre-posted control receive pool, never
+ * refreshed. */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
