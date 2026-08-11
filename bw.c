@@ -829,8 +829,10 @@ static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
                           struct ibv_sge *sges, struct bw_data_state *st,
                           int final)
 {
-    uint32_t inline_flag = 0;
-            //size <= ctx->max_inline_data ? IBV_SEND_INLINE : 0;
+    uint32_t inline_flag =
+    (size <= 64 && size <= ctx->max_inline_data)
+        ? IBV_SEND_INLINE
+        : 0;
 
     while (n > 0) {
         uint64_t chunk = n < SIGNAL_INTERVAL ? n : SIGNAL_INTERVAL;
