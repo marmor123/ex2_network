@@ -7,9 +7,9 @@
  * ex1's converged counts table. Per size the timed batch of RDMA WRITEs
  * (no warmup — ex1's warmup counts measured no benefit, and their wire
  * time sits inside the measured window): K WRs posted per ibv_post_send
- * as a linked list (W=256, K=64, fixed — no options), only the K-th WR of
- * the stream signaled — one CQE per K WRs, so completions are accounted
- * in exact multiples of K (RC in-order)
+ * as a linked list (W=256, K=64, fixed — no options), only the last WR of
+ * each posted batch signaled — one CQE per K WRs, so completions are
+ * accounted in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
  * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
  * The clock (CLOCK_MONOTONIC) starts at the first timed post and stops at
@@ -101,8 +101,8 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
 #define CTRL_POLL_TIMEOUT_SEC 10
 
 /* The run's fixed configuration — the option-era -r/-k/-p/-i are gone:
- * pipe depth W, signal interval K (only the K-th WR of the stream is
- * signaled), the device's IB port 1, and the TCP handshake port. */
+ * pipe depth W, signal interval K (only the last WR of each posted batch
+ * is signaled), the device's IB port 1, and the TCP handshake port. */
 
 /* The SQ depth is requested as W + K — the pipe depth plus one signal
  * interval, exactly the deepest the refill lets the SQ get: its single
@@ -767,23 +767,21 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
 }
 
 /* The client's streaming data-path state for one size: the windowed
- * pipeline (ADR-0002). posted counts every WR of the size's stream so
- * the signal schedule can pick the K-th WRs; outstanding is posted minus
- * the WRs the refill has reclaimed — exactly K per reclaimed CQE,
- * because only K-th WRs are signaled and RC completions are in-order;
- * the final list's remainder is covered by the CQEs the ack wait
- * consumes, never by the refill. Scoped to one size: the ack wait
- * consumes the remaining data and done completions without touching the
- * state, so it must not survive into the next size. */
+ * pipeline (ADR-0002). outstanding is posted minus the WRs the refill
+ * has reclaimed — exactly K per reclaimed CQE, because only the last WR
+ * of each K-WR batch is signaled and RC completions are in-order; the
+ * final batch's remainder is covered by the CQEs the ack wait consumes,
+ * never by the refill. Scoped to one size: the ack wait consumes the
+ * remaining data and done completions without touching the state, so it
+ * must not survive into the next size. */
 struct bw_data_state {
-    uint64_t posted;
     uint64_t outstanding;
 };
 
 /* Refill-never-empty (ADR-0002): once the SQ is as deep as it can be,
  * reclaim only the CQEs that are ready — each data CQE accounts for
- * exactly K WRs, because only the K-th WR of the stream is signaled and
- * RC completions are in-order — then return immediately so the caller
+ * exactly K WRs, because only the last WR of each K-WR batch is signaled
+ * and RC completions are in-order — then return immediately so the caller
  * reposts; the SQ never empties and the NIC never idles. The single
  * trigger is the SQ depth itself: with the SQ sized W + K (bw_init_ctx),
  * waiting while outstanding + K ≥ sq_depth holds the pipe at W
@@ -816,14 +814,17 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 
 /* Post `n` RDMA WRITEs of `size` bytes into the server's registered
  * buffer, as a stream of K-WR linked lists, one per ibv_post_send (the
- * last list takes the remainder). Signal schedule: the K-th WR of the
- * size's stream (t % K == 0) and the stream's final WR — mid-stream
- * lists therefore yield one CQE per K WRs, while the final remainder is
- * accounted exactly by the signaled final WR (in-order RC). Messages ≤
+ * last list takes the remainder). Signal schedule: the last WR of every
+ * batch — wrs[63] of a full batch, set once per size below; the final
+ * partial batch's last WR, set in the post loop — so each full batch
+ * yields one CQE per K WRs, while the final remainder is accounted
+ * exactly by the signaled final WR (in-order RC). Messages ≤
  * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
  * the registered buffer. `wrs`/`sges` are the caller's K-deep WR arrays,
- * reused for every list. `final` marks the call that posts the stream's
- * last list (the timed one). */
+ * their constant fields preinitialized once at allocation; per size only
+ * the changing fields (length, send_flags, next) are rewritten here.
+ * `final` marks the call that posts the stream's last list (the timed
+ * one). */
 static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
                           size_t size, uint64_t n, struct ibv_send_wr *wrs,
                           struct ibv_sge *sges, struct bw_data_state *st,
@@ -833,44 +834,42 @@ static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
     (size <= 64 && size <= ctx->max_inline_data)
         ? IBV_SEND_INLINE
         : 0;
+    uint64_t i;
+
+    /* Per size, rewrite only what changes: the payload length, the
+     * inline/signaled flags (wrs[63] of a full batch is signaled), and
+     * the chain — restoring the cut the previous final partial batch
+     * made. */
+    for (i = 0; i < SIGNAL_INTERVAL; ++i) {
+        sges[i].length = size;
+
+        wrs[i].send_flags =
+                inline_flag |
+                ((i == SIGNAL_INTERVAL - 1) ? IBV_SEND_SIGNALED : 0);
+
+        wrs[i].next = i + 1 < SIGNAL_INTERVAL ? &wrs[i + 1] : NULL;
+    }
 
     while (n > 0) {
         uint64_t chunk = n < SIGNAL_INTERVAL ? n : SIGNAL_INTERVAL;
         struct ibv_send_wr *bad_wr;
-        uint64_t i;
 
         if (bw_refill(ctx, st))
             return 1;
 
-        for (i = 0; i < chunk; ++i) {
-            uint64_t t = st->posted + i + 1; /* this WR's position in the stream */
-            uint32_t signal =
-                    (t % SIGNAL_INTERVAL == 0) ||
-                    (final && n == chunk && i == chunk - 1);
-
-            sges[i] = (struct ibv_sge) {
-                    .addr	= (uint64_t) ctx->buf,
-                    .length = size,
-                    .lkey	= ctx->mr->lkey
-            };
-            wrs[i] = (struct ibv_send_wr) {
-                    .wr_id	    = BW_DATA_WRID,
-                    .opcode	    = IBV_WR_RDMA_WRITE,
-                    .send_flags = inline_flag |
-                                  (signal ? IBV_SEND_SIGNALED : 0),
-                    .sg_list    = &sges[i],
-                    .num_sge    = 1,
-                    .next	    = i + 1 < chunk ? &wrs[i + 1] : NULL
-            };
-            wrs[i].wr.rdma.remote_addr = dest->buf_addr;
-            wrs[i].wr.rdma.rkey = dest->rkey;
+        /* The final partial batch: make its last WR signaled — the one
+         * CQE accounting for the remainder — and terminate the list
+         * there. A full final batch needs nothing: wrs[63] is already
+         * signaled and already terminates the chain. */
+        if (final && n == chunk && chunk < SIGNAL_INTERVAL) {
+            wrs[chunk - 1].send_flags = inline_flag | IBV_SEND_SIGNALED;
+            wrs[chunk - 1].next = NULL;
         }
 
         if (ibv_post_send(ctx->qp, &wrs[0], &bad_wr)) {
             fprintf(stderr, "Couldn't post data WRITEs\n");
             return 1;
         }
-        st->posted += chunk;
         st->outstanding += chunk;
         n -= chunk;
     }
@@ -903,11 +902,15 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
  * refreshed. */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
-    /* The K-deep WR arrays, reused for every linked list of the sweep. */
+    /* The K-deep WR arrays, reused for every linked list of the sweep.
+     * Their constant fields — the WR identity, the RDMA target, the
+     * source address — are initialized once here; bw_post_writes rewrites
+     * only the fields that change per size (length, send_flags, next). */
     struct ibv_send_wr *wrs;
     struct ibv_sge *sges;
     uint32_t seq;
     int rc = 1;
+    int i;
 
     wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
     sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
@@ -916,13 +919,26 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
         goto out;
     }
 
+    for (i = 0; i < SIGNAL_INTERVAL; ++i) {
+        wrs[i].wr_id		= BW_DATA_WRID;
+        wrs[i].opcode		= IBV_WR_RDMA_WRITE;
+        wrs[i].num_sge		= 1;
+        wrs[i].sg_list		= &sges[i];
+        wrs[i].next		= i + 1 < SIGNAL_INTERVAL ? &wrs[i + 1] : NULL;
+        wrs[i].wr.rdma.remote_addr = dest->buf_addr;
+        wrs[i].wr.rdma.rkey	= dest->rkey;
+
+        sges[i].addr		= (uint64_t) ctx->buf;
+        sges[i].lkey		= ctx->mr->lkey;
+    }
+
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
         uint64_t count = MSG_COUNTS[seq];
         struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
-        struct bw_data_state st = { 0, 0 };
+        struct bw_data_state st = { 0 };
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
