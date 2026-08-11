@@ -5,9 +5,10 @@
 
 CC ?= gcc
 
-# The compile gate requires exactly this flag set; pinned so an environment
-# CFLAGS cannot silently change what the gate checks.
-CFLAGS = -O3 -Wall -Wextra
+# The compile gate requires this flag set; pinned so an environment CFLAGS
+# cannot silently change what the gate checks. The -march/-mtune=native pair
+# targets the build machine, so build on the node the benchmark runs on.
+CFLAGS = -O3 -Wall -Wextra -march=native -mtune=native -flto -funroll-loops
 LDLIBS = -libverbs
 
 all: server client
