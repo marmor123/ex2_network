@@ -4,11 +4,12 @@
  *
  * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
  * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
- * ex1's converged counts table. Per size a warmup batch rides the same
- * windowed stream ahead of the timed batch, then the timed batch of RDMA
- * WRITEs: K WRs posted per ibv_post_send as a linked list (W=256, K=64,
- * fixed — no options), only the K-th WR of the stream signaled — one CQE per K
- * WRs, so completions are accounted in exact multiples of K (RC in-order)
+ * ex1's converged counts table. Per size the timed batch of RDMA WRITEs
+ * (no warmup — ex1's warmup counts measured no benefit, and their wire
+ * time sits inside the measured window): K WRs posted per ibv_post_send
+ * as a linked list (W=256, K=64, fixed — no options), only the K-th WR of
+ * the stream signaled — one CQE per K WRs, so completions are accounted
+ * in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
  * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
  * The clock (CLOCK_MONOTONIC) starts at the first timed post and stops at
@@ -72,18 +73,13 @@
 
 /* The ex1 converged counts table, verbatim: one entry per size of the
  * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
- * (throughput variance < 1% between doubled counts); WARMUP_COUNTS from
- * ex1's warmup probe. */
+ * (throughput variance < 1% between doubled counts). */
 static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         1310720, 81920, 655360, 163840, 327680, /* 1B 2B 4B 8B 16B */
         20480, 81920, 81920, 40960, 20480,      /* 32B 64B 128B 256B 512B */
         20480, 20480, 20480, 2560, 2560,        /* 1KB 2KB 4KB 8KB 16KB */
         2560, 640, 320, 160, 160,               /* 32KB 64KB 128KB 256KB 512KB */
         80                                       /* 1MB */
-};
-
-static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
-        16, 4, 4, 32, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
 };
 
 /* Control messages: 8 bytes each — a fixed tag plus the sequence counter
@@ -113,10 +109,11 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
 
 /* The run's fixed configuration — the option-era -r/-k/-p/-i are gone:
  * window depth W (the refill reclaims once W data WRs are outstanding),
- * signal interval K (only the K-th WR of the stream is signaled), and the
- * TCP handshake port. */
+ * signal interval K (only the K-th WR of the stream is signaled), the
+ * device's IB port 1, and the TCP handshake port. */
 #define WINDOW 256
 #define SIGNAL_INTERVAL 64
+#define IB_PORT 1
 #define HANDSHAKE_PORT 18515
 
 /* K ≤ W and K ≤ QP_SLACK, so the refill's guarantee holds — after the last
@@ -816,15 +813,14 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
 }
 
 /* The client's streaming data-path state for one size: the windowed
- * pipeline (ADR-0002). posted counts every WR of the size's stream
- * (warmup + timed) so the signal schedule can pick the K-th WRs;
- * outstanding is posted minus the WRs the refill has reclaimed — exactly
- * K per reclaimed CQE, because only K-th WRs are signaled and RC
- * completions are in-order; the warmup residual and the final list's
- * remainder are covered by the CQEs the ack wait consumes, never by the
- * refill. Scoped to one size: the ack wait consumes the remaining data
- * and done completions without touching the state, so it must not
- * survive into the next size. */
+ * pipeline (ADR-0002). posted counts every WR of the size's stream so
+ * the signal schedule can pick the K-th WRs; outstanding is posted minus
+ * the WRs the refill has reclaimed — exactly K per reclaimed CQE,
+ * because only K-th WRs are signaled and RC completions are in-order;
+ * the final list's remainder is covered by the CQEs the ack wait
+ * consumes, never by the refill. Scoped to one size: the ack wait
+ * consumes the remaining data and done completions without touching the
+ * state, so it must not survive into the next size. */
 struct bw_data_state {
     uint64_t posted;
     uint64_t outstanding;
@@ -868,8 +864,8 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
  * buffer, as a stream of K-WR linked lists, one per ibv_post_send (the
  * last list takes the remainder). Signal schedule: the K-th WR of the
  * size's stream (t % K == 0) and the stream's final WR — mid-stream
- * lists therefore yield one CQE per K WRs, while the warmup residual and
- * the final remainder are accounted exactly (in-order RC). Messages ≤
+ * lists therefore yield one CQE per K WRs, while the final remainder is
+ * accounted exactly by the signaled final WR (in-order RC). Messages ≤
  * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
  * the registered buffer. `wrs`/`sges` are the caller's K-deep WR arrays,
  * reused for every list. `final` marks the call that posts the stream's
@@ -941,10 +937,9 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* Client side of the full sweep: per size, the warmup batch of WRITEs
- * rides the windowed stream ahead of the timed batch — the clock starts
- * at the first timed post and stops at the ack-receive completion
- * (ADR-0003) — closed by the done SEND. The done needs one free SQ slot:
+/* Client side of the full sweep: per size, the clock starts at the first
+ * timed post and stops at the ack-receive completion (ADR-0003) — closed
+ * by the done SEND. The done needs one free SQ slot:
  * the refill leaves at most W - 1 + K ≤ sq_depth - 1 WRs outstanding
  * after the last list (K ≤ QP_SLACK), so it always fits. The ack wait
  * passes the data and done-send completions through; the 21 acks consume
@@ -971,10 +966,6 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
         struct timespec t0, t1;
         double elapsed;
         struct bw_data_state st = { 0, 0 };
-
-        if (bw_post_writes(ctx, dest, size, WARMUP_COUNTS[seq],
-                           wrs, sges, &st, 0))
-            goto out;
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
