@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!-- Geometry harness: render every built stop x frame under variant D and
+     report panel/diagram/overflow measurements. Not part of the app. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>geo</title>
+  <link rel="stylesheet" href="../../prototype/app-shell/css/app.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    window.__errors = [];
+    window.onerror = function (m) { window.__errors.push(String(m)); };
+  </script>
+  <script src="../../prototype/app-shell/js/content.js"></script>
+  <script src="../../prototype/app-shell/js/chart.js"></script>
+  <script src="../../prototype/app-shell/js/diagrams.js"></script>
+  <script src="../../prototype/app-shell/js/app.js"></script>
+  <script>
+    (function () {
+      var out = [];
+      var stops = window.APP.spine.filter(function (s) { return s.state === "built"; });
+      function goto(hash) {
+        location.hash = hash;
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      }
+      stops.forEach(function (s) {
+        var st = window.APP.stops[s.id];
+        st.frames.forEach(function (f, fi) {
+          goto("stop=" + s.id);
+          var next = document.querySelector(".d-corner.next");
+          for (var i = 0; i < fi && next; i++) next.click();
+          var rect = function (sel) {
+            var el = document.querySelector(sel);
+            if (!el) return "MISSING";
+            var r = el.getBoundingClientRect();
+            return Math.round(r.width) + "x" + Math.round(r.height);
+          };
+          var svg = document.querySelector(".dk-svg");
+          var svgSize = svg ? Math.round(svg.getBoundingClientRect().width) + "x" + Math.round(svg.getBoundingClientRect().height) : "MISSING";
+          var nCode = document.querySelectorAll(".code-line").length;
+          var nGut = document.querySelectorAll(".gutter-cell").length;
+          var gutterOk = nCode === 0 || nCode === nGut;
+          out.push(s.id + "/f" + fi + " " + (rect(".d-code-panel")) + " " + (rect(".d-explain-panel")) + " " + (rect(".d-diagram-panel")) + " svg=" + svgSize + " gutter=" + (gutterOk ? "ok" : nCode + "!=" + nGut));
+        });
+      });
+      goto("home");
+      var overflow = document.documentElement.scrollWidth - window.innerWidth;
+      var el = document.createElement("div");
+      el.id = "report";
+      el.style.cssText = "position:fixed;bottom:4px;left:4px;z-index:999;font:10px monospace;color:#333;background:#fff;padding:4px 8px;border:1px solid #999;max-height:300px;overflow:auto;white-space:pre;";
+      el.textContent = (window.__errors.length ? "ERRORS: " + window.__errors.join(" || ") + "\n" : "") +
+        "hOverflow(px): " + overflow + "\n" + out.join("\n");
+      document.body.appendChild(el);
+    })();
+  </script>
+</body>
+</html>

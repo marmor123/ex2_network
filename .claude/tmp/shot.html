@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!-- Screenshot harness: ?stop=X&frame=N renders variant D stop X at frame N.
+     Not part of the app. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>shot</title>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    window.onerror = function (m) {
+      var r = document.getElementById("marker");
+      if (r) r.textContent = "ERR " + String(m);
+    };
+  </script>
+  <script src="../../prototype/app-shell/js/content.js"></script>
+  <script src="../../prototype/app-shell/js/chart.js"></script>
+  <script src="../../prototype/app-shell/js/diagrams.js"></script>
+  <script src="../../prototype/app-shell/js/app.js"></script>
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      var stop = q.get("stop"), frame = parseInt(q.get("frame") || "0", 10);
+      var marker = document.createElement("div");
+      marker.id = "marker";
+      marker.style.cssText = "position:fixed;bottom:4px;right:4px;z-index:999;font:11px monospace;color:#888;background:#fff;padding:2px 6px;border:1px solid #ddd;";
+      document.body.appendChild(marker);
+      location.hash = "stop=" + stop;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      var next = document.querySelector(".d-corner.next");
+      for (var i = 0; i < frame && next; i++) next.click();
+      var cur = document.querySelector(".d-frame-title");
+      marker.textContent = stop + " · frame " + frame + " · " + (cur ? cur.textContent : "?");
+    })();
+  </script>
+</body>
+</html>

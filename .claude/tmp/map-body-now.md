@@ -1,0 +1,45 @@
+## Destination
+
+Understand the ex2 project end-to-end — every function, structural choice, decision (ADR), and measurement — well enough to (1) **audit and improve it**: find real mistakes and optimization headroom, apply the fixes before the oral exam (~1 month out), with measured justification where it matters, and (2) **defend it in the oral exam**: explain not just what the code does but why it was written like that — original choices and improvements. The understanding is carried in a detailed teaching web app: a "follow the data" spine at exploded granularity (every function, every ADR, every anomaly), each stop layering concept → annotated code → the ADR's why → viva what-ifs.
+
+## Notes
+
+- **Domain**: ex2_network — Verbs API throughput benchmark (RDMA WRITE) on the course ConnectX-3 pairs. Read `CONTEXT.md` (glossary — use its vocabulary), `docs/adr/` (7 ADRs — the decision record), `assignment.md`, `slides.md`, `verify.sh`.
+- **The user did not write the code** — an AI built it via grilling; the user's understanding is the whole point. Plain, concrete language; no assumed C/RDMA knowledge.
+- **Node access is user-mediated only**: the user alone can SSH to mlxstud nodes and runs commands we hand them (as with the T6 verify.sh runs). Experiments = HITL task tickets with precise checklists, batched per session; sharpen hypotheses AFK first.
+- **Execution is in scope** (override of plan-only): the app gets built (task tickets) and code may be fixed after the audit — the destination includes them.
+- **App decisions so far**: static HTML + lightweight JS, no build toolchain (form); "follow the data" spine at exploded detail (spine); every stop = concept / code / why / what-if (depth); design settled via prototype — **variant D "Studio"** (issue #9): split-screen frames, Claude-like cream/terracotta design, SVG diagram kit, bottom-corner arrows + dotted progress (conventions on the ticket); charts follow the dataviz skill.
+- **Full code coverage (user requirement, 2026-08-06)**: every function in bw.c appears annotated in some stop — the build covers the whole file, not just the data path. Build tickets #14/#15/#16 carry the per-ticket function inventory.
+- **Measurement anomalies to explain**: 1 MB dip (~1.8 Gbps below 64 KB, the "80-WR stream"), 2 KB ramp, ≤ 1 KB inline copy at ~853 MB/s (copying agent unattributed), ~6.1M msg/s small-size ceiling, 38 vs 42.5 Gbps dev-pair vs final-pair gap.
+- **User's priority knowledge gaps — teach these first in the app**: (a) the `max_inline_data` declare-then-read-back mechanism (ADR-0002; "we asked the hardware, not a header"), (b) why the refill discipline replaces the template's wait-for-all-completions (`pp_wait_completions`, ADR-0002), (c) why W=256 / K=64 are the measured optimum (the T6 A/B, ADR-0006/0007). The user raised all three explicitly; each has a crisp viva story.
+- **Exam**: ~1 month out (early Sept 2026); covers ex1 + ex2; format unknown ("probably all of it") — prepare for explaining, defending choices, possibly a live walkthrough.
+- **Improvement scope**: performance AND correctness — whatever the audit finds.
+
+## Decisions so far
+
+- [Audit bw.c: correctness, edge cases, spec compliance](https://github.com/marmor123/ex2_network/issues/10) — **no correctness bugs**; all components satisfy the assignment and all 7 ADRs (9/9 correct, 1 inaccurate comment); hardening nits: `sq_depth ≤ k` spin (unreachable on course hardware), `-n` parse wrap, no counts-table static assert. Findings: `docs/research/audit-bw-c.md`.
+- [Why is small-message throughput capped at ~6.1M msg/s?](https://github.com/marmor123/ex2_network/issues/11) — the ceiling is a **flat ~163 ns/message** (size-, window-, machine-invariant); the post rate is **slaved to the HCA's completion production** (refill spins on empty CQ); two surviving candidates: per-WQE build cost vs the HCA's per-QP WQE-processing rate (~6.1M/s, corroborated by published ConnectX-3 measurements) — discriminating on-node checklist in the findings. Findings: `docs/research/small-size-ceiling.md`.
+- [What performs the ~853 MB/s per-message copy at ≤1 KB?](https://github.com/marmor123/ex2_network/issues/12) — the copy is **performed by the HCA firmware, not software**: libmlx4 and the kernel ruled out (flag is only a WQE-layout hint; `max_inline_data` consulted only inside the flag block); the plateau is byte-proportional, bounded at exactly `max_inline_data`, identical with/without the flag — killer experiment (declare 0) in the findings checklist. Findings: `docs/research/inline-copy.md`.
+- [The DMA regime's shape: 2 KB ramp, 1 MB dip, pair gap](https://github.com/marmor123/ex2_network/issues/13) — **1 MB dip = warmup-in-window arithmetic** (rate = R·n/(n+4): 80/84 at 1 MB → predicts 40.54 vs measured 40.57 — a real optimization lead: warmup ≥ W would recover ~1.76 Gbps); **2 KB ramp = ~495 ns per-message mlx4 DMA floor** (crossover lands between 2–4 KB); **pair gap = host interface**, not FDR (~54.5 Gbps net): both pairs most plausibly Gen3 x8, different read efficiencies; on-node probes (`-n` overrides, `lspci`, `ibstat`) in the findings checklist. Findings: `docs/research/dma-regime-shape.md`.
+- [Design prototype: the app shell and the first two stops](https://github.com/marmor123/ex2_network/issues/9) — **design locked: variant D "Studio"**. Split-screen frames (code top-left, explanation bottom-left, diagram right, synced per frame); Claude-like cream/terracotta design; SVG diagram kit (paper dot-grid, three arrow dialects, leader callouts, facts strips); bottom-corner arrows + dotted progress. A (field notes), B (system map), C (viva deck) rejected. Prototype on branch `prototype/app-shell`. New requirement: full bw.c coverage.
+- [Build the app: setup chapters (experiment, handshake, memory region)](https://github.com/marmor123/ex2_network/issues/14) — **stops 1–3 built** on `prototype/app-shell` (commit `1257fc3`): experiment extended with counts-table + control-message frames; **the handshake** and **memory region** stops built per variant D (split-screen, ◆ gutter annotations, 13 new SVG diagrams with facts strips, ADR-0001/0002 why cards, audit facts). Full coverage checklist satisfied — incl. `bw_post_control_recvs` (the closing-chapters ticket may reference it). Verified: all four variants render, no JS errors; split-screen panels now scroll internally (CSS fix). Sweep total corrected to ~2.86M WRs (audit said 2.81M).
+
+- [Build the app: data-path chapters (posting, doorbell, wire, landing, completions)](https://github.com/marmor123/ex2_network/issues/15) — **stops 5–8 built** on `prototype/app-shell` (commit `1859051`): the doorbell (WQE ring + posted MMIO bell, ~2 ns/msg amortized), the wire (inline-vs-DMA at max_inline_data; the ~853 MB/s copy attributed to the **HCA**, not software — research #12; the 2 KB ~495 ns per-message DMA floor — research #13), landing (`bw_server_ctrl_exchange` annotated; done→ack completion barrier, ADR-0003), completions (wr_id taxonomy, `bw_wc_bad`, `bw_poll_until` with 10 s deadline, `bw_data_state` accounting, the four pipeline constants, completion-slaved ~163 ns ceiling — research #11). Stop 4 (posting) was already built in the prototype phase. Full ticket #15 coverage checklist anchored; validator extended, headless frame-by-frame smoke clean. `bw_poll_until`/`bw_wc_bad`/`bw_server_ctrl_exchange` annotated for the closing chapters to reference.
+- [Build the app: envelope, choices, and audit chapters](https://github.com/marmor123/ex2_network/issues/16) — **closing chapters built** on `prototype/app-shell` (commit `72f12a7`): the **control round trip** (`bw_post_ctrl_send` inline + staged fallback, `bw_recv_ctrl` with t1/tag/seq, the CQ in order, the exchange timeline), the **envelope** (chart embedded; three regimes; 1 MB dip as R·n/(n+4) arithmetic; 2 KB floor; pair gap; all five anomalies), the **choices** (each ADR with its rejected alternative — incl. the template's `pp_wait_completions`), the **audit** (12 verdicts, the one wrong comment, the four hardenings, the proved invariant, what the records prove), the **harness** (argc dispatch, 7 flags, bounds, device pick, teardown). Full bw.c coverage: **all 18 functions annotated** (checklist anchored). 27 new SVG diagrams; smoke clean over 13 stops, all frames, variants A/B/C. Screenshots in `.claude/tmp/shots/` — eyeball before the viva ticket.
+
+## Not yet specified
+
+- Re-measurement runs on the course nodes (user-mediated) after any applied fixes
+- GitHub Pages hosting for the app (optional, not required)
+- Whether the two-QP aggregate idea (small-size ceiling) gets pursued — only if the proposal ticket's measurement session leaves it standing
+
+## Out of scope
+
+- ex1 (TCP exercise) exam prep — the exam covers it, but the user scoped the app to ex2
+- Lecture/slides material as standalone chapters — only as concept layers inside stops
+- Re-architecting bw.c beyond audit findings
+- Any app framework or build toolchain (form decision)
+- Multi-project or public-facing features
+
+
+

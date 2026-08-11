@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <title>smoke</title>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="report">RUNNING</div>
+  <script>
+    window.__errors = [];
+    window.onerror = function (m) { window.__errors.push(String(m)); };
+    window.addEventListener("error", function (e) { window.__errors.push(String(e.message)); });
+  </script>
+  <script src="../prototype/app-shell/js/content.js"></script>
+  <script src="../prototype/app-shell/js/chart.js"></script>
+  <script src="../prototype/app-shell/js/diagrams.js"></script>
+  <script src="../prototype/app-shell/js/app.js"></script>
+  <script>
+    (function () {
+      var report = document.getElementById("report");
+      var stops = window.APP.spine.filter(function (s) { return s.state === "built"; });
+      function goto(hash) {
+        location.hash = hash;
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      }
+      stops.forEach(function (s) { goto("stop=" + s.id); });
+      goto("home");
+      var detail = stops.map(function (s) {
+        return s.id + ":" + window.APP.stops[s.id].frames.length + "fr";
+      }).join(", ");
+      report.textContent = (window.__errors.length
+        ? "ERRORS: " + window.__errors.join(" || ")
+        : "ALL_OK") + " | built=" + detail;
+    })();
+  </script>
+
+
+</body></html>

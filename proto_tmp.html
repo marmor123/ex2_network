@@ -1,3 +1,320 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE — throwaway. Answers wayfinder ticket #22: does the two-line tour
+  shell feel right? Three variants of the shell (bubble placement, tour-line
+  form, entry feel, highlight treatment), switchable via ?variant=A|B|C,
+  sharing four sample stations drafted in the light-skeleton voice (what /
+  how / why, watch-outs, cross-links, one predict-then-confirm). Nothing here
+  ships: the build ticket reimplements whatever gets approved.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prototype — bw.c two-line tour shell (ticket #22)</title>
+<style>
+  :root {
+    --bg: #0b1220;
+    --bg2: #0f172a;
+    --line: #1e293b;
+    --ink: #dbe4f0;
+    --dim: #64748b;
+    --gutter: #4b5a72;
+    --accent: #38bdf8;
+    --warn: #fbbf24;
+    --ok: #34d399;
+    --pink: #f472b6;
+    --violet: #c4b5fd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+  }
+  #layout { position: relative; height: 100vh; }
+  #file-line {
+    font-family: Consolas, "Cascadia Mono", Menlo, monospace;
+    font-size: 13.5px; line-height: 1.62; overflow: auto;
+  }
+  .fl-line { display: flex; }
+  .fl-g {
+    flex-shrink: 0; width: 4.2em; text-align: right; padding-right: 1.1em;
+    color: var(--gutter); user-select: none; position: sticky; left: 0;
+    background: var(--bg);
+  }
+  .fl-c { white-space: pre; flex: 1; padding-right: 10px; }
+  .tk.kw  { color: #7dd3fc; }
+  .tk.type{ color: #a5b4fc; }
+  .tk.num { color: var(--warn); }
+  .tk.str { color: #86efac; }
+  .tk.com { color: #556580; font-style: italic; }
+  .tk.pp  { color: var(--violet); }
+
+  /* ---- three-state highlight (shared rules; treatment varies) ---- */
+  .st-open > .fl-c   { background: rgba(56,189,248,.14); box-shadow: inset 2px 0 0 var(--accent); }
+  .st-open > .fl-g   { color: #7dd3fc; }
+  .st-preview > .fl-c{ background: rgba(148,163,184,.13); }
+  .st-cur > .fl-g    { color: var(--warn); font-weight: 600; }
+  .st-cur.st-open > .fl-g { color: #7dd3fc; }
+
+  /* ================= VARIANT A — Rail ================= */
+  body[data-variant="A"] #layout { display: flex; flex-direction: column; }
+  body[data-variant="A"] .row { display: flex; flex: 1; min-height: 0; }
+  body[data-variant="A"] #file-line { flex: 1; }
+  body[data-variant="A"] #rail {
+    width: 400px; flex-shrink: 0; border-left: 1px solid var(--line);
+    background: var(--bg2); overflow-y: auto;
+  }
+  body[data-variant="A"] #tourA {
+    height: 54px; border-top: 1px solid var(--line); display: flex;
+    align-items: center; gap: 10px; padding: 0 14px; background: var(--bg2);
+  }
+  .chip {
+    border: 1px solid #334155; border-radius: 999px; padding: 4px 12px;
+    font-size: 12.5px; color: #aab8cc; cursor: pointer; background: transparent;
+    white-space: nowrap;
+  }
+  .chip:hover { border-color: var(--accent); color: #e0f2fe; }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #06283f; font-weight: 600; }
+  .chip.cur:not(.on) { border-color: var(--warn); color: var(--warn); }
+  .chip .no { font-weight: 700; margin-right: 6px; opacity: .8; }
+  #startBtn {
+    background: var(--accent); color: #06283f; border: none; border-radius: 999px;
+    padding: 7px 16px; font-weight: 700; font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  #nextHint { margin-left: auto; font-size: 12px; color: var(--dim); white-space: nowrap; }
+  #nextHint b { color: var(--accent); }
+
+  /* bubble content (shared by A rail, B card, C sheet) */
+  .bubble { padding: 18px 20px; }
+  .bubble h2 { margin: 0 0 2px; font-size: 17px; }
+  .b-sub { color: var(--dim); font-size: 12px; margin-bottom: 12px; }
+  .b-sub .tag {
+    display: inline-block; border: 1px solid #334155; border-radius: 4px;
+    padding: 1px 7px; margin-right: 6px; font-size: 11px; color: #93a5bd;
+  }
+  .b-sub .typ { text-transform: uppercase; letter-spacing: .08em; color: var(--violet); margin-right: 8px; }
+  .bubble p { font-size: 13.5px; line-height: 1.55; margin: 0 0 10px; color: #c8d4e4; }
+  .bubble p strong { color: var(--ink); }
+  .b-lead { color: #e8f1fb; font-size: 14px !important; font-weight: 600; }
+  .b-watch {
+    border-left: 3px solid var(--warn); background: rgba(251,191,36,.07);
+    padding: 8px 12px; border-radius: 0 8px 8px 0; margin: 0 0 10px; font-size: 13px;
+    color: #e7d5a8; line-height: 1.5;
+  }
+  .b-pred { border: 1px dashed #475569; border-radius: 8px; padding: 10px 12px; margin: 0 0 10px; }
+  .b-pred .q { font-size: 13px; color: #a5b4fc; margin: 0 0 6px; }
+  .b-pred .a { font-size: 13px; color: #dbe4f0; margin: 8px 0 0; }
+  .b-pred button {
+    background: #334155; color: #e0f2fe; border: none; border-radius: 6px;
+    padding: 4px 12px; font-size: 12px; cursor: pointer;
+  }
+  .hidden { display: none; }
+  .b-x { margin-top: 4px; }
+  .b-x span { font-size: 11px; color: var(--dim); display: block; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .07em; }
+  .xchip {
+    display: inline-block; border: 1px solid #334155; background: #16213a;
+    border-radius: 6px; padding: 2px 8px; font-size: 11.5px; color: #93c5fd;
+    margin: 0 6px 6px 0; font-family: Consolas, monospace;
+  }
+  .b-diag { margin: 4px 0 12px; }
+  .b-diag svg { width: 100%; height: auto; display: block; }
+  .b-diag figcaption { font-size: 11.5px; color: var(--dim); margin-top: 6px; line-height: 1.5; }
+  .b-nav { display: flex; gap: 8px; margin-top: 14px; }
+  .b-nav button {
+    flex: 1; padding: 7px; border-radius: 8px; border: 1px solid #334155;
+    background: #16213a; color: #dbe4f0; font-size: 13px; cursor: pointer;
+  }
+  .b-nav button:hover { border-color: var(--accent); }
+  .b-close { position: absolute; top: 10px; right: 12px; background: none; border: none; color: var(--dim); font-size: 18px; cursor: pointer; }
+  .b-placeholder { padding: 22px; color: var(--dim); font-size: 13.5px; line-height: 1.6; }
+  .b-placeholder h3 { color: #aab8cc; font-size: 14px; margin: 0 0 8px; }
+  .b-placeholder .slist { margin-top: 14px; }
+  .b-placeholder .sitem { padding: 8px 0; border-top: 1px solid #1e293b; cursor: pointer; }
+  .b-placeholder .sitem:hover { color: #e0f2fe; }
+  .b-placeholder .sitem b { font-size: 12.5px; }
+  .b-placeholder .sitem .meta { font-size: 11px; color: var(--dim); }
+
+  /* ================= VARIANT B — Float ================= */
+  body[data-variant="B"] #file-line { height: 100%; padding-right: 34px; }
+  body[data-variant="B"] #rail, body[data-variant="B"] #tourA,
+  body[data-variant="B"] #stepperC, body[data-variant="B"] #sheet,
+  body[data-variant="B"] #overlayC { display: none; }
+  #minimap {
+    position: fixed; right: 6px; top: 50%; transform: translateY(-50%);
+    width: 12px; z-index: 40; display: none;
+  }
+  body[data-variant="B"] #minimap { display: flex; flex-direction: column; gap: 2px; }
+  #minimap .track { flex: 1; width: 4px; background: #22304a; border-radius: 2px; position: relative; }
+  #minimap .tick {
+    position: absolute; left: 50%; width: 8px; height: 8px; border-radius: 2px;
+    transform: translate(-50%, -50%); background: #64748b; cursor: pointer; transition: height .12s;
+  }
+  #minimap .tick.s1 { background: var(--ok); }
+  #minimap .tick.s2 { background: var(--violet); }
+  #minimap .tick.s3 { background: var(--accent); }
+  #minimap .tick.s4 { background: var(--warn); }
+  #minimap .tick.cur { height: 14px; border: 1px solid #fff; }
+  #minimap .tick:hover { transform: translate(-50%,-50%) scale(1.4); }
+  #beginBtn {
+    position: fixed; right: 28px; bottom: 28px; z-index: 40; display: none;
+    background: var(--accent); color: #06283f; border: none; border-radius: 999px;
+    padding: 11px 20px; font-weight: 700; font-size: 13.5px; cursor: pointer;
+    box-shadow: 0 8px 24px rgba(56,189,248,.35);
+  }
+  body[data-variant="B"] #beginBtn { display: block; animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 8px 24px rgba(56,189,248,.25); } 50% { box-shadow: 0 8px 34px rgba(56,189,248,.6); } }
+  body[data-variant="B"] .fl-line.dim .fl-c { opacity: .3; }
+  body[data-variant="B"] .fl-line.dim .fl-g { opacity: .45; }
+  body[data-variant="B"] .st-preview > .fl-c { background: transparent; text-decoration: underline; text-decoration-color: #64748b; }
+  #bubbleB {
+    position: fixed; width: 350px; background: var(--bg2); border: 1px solid #334155;
+    border-radius: 14px; box-shadow: 0 16px 48px rgba(0,0,0,.55); z-index: 60;
+    display: none; max-height: 70vh; overflow-y: auto;
+  }
+  #bubbleB .bubble { position: relative; }
+
+  /* ================= VARIANT C — Deck ================= */
+  body[data-variant="C"] #file-line { height: 100%; padding-bottom: 120px; }
+  body[data-variant="C"] #rail, body[data-variant="C"] #tourA,
+  body[data-variant="C"] #minimap, body[data-variant="C"] #bubbleB,
+  body[data-variant="C"] #beginBtn { display: none; }
+  body[data-variant="C"] #file-line { max-width: 1000px; margin: 0 auto; }
+  body[data-variant="C"] .fl-line.st-start .fl-g::before {
+    content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 6px; vertical-align: 2px;
+  }
+  body[data-variant="C"] .fl-line.st-start .fl-g { color: #c8d4e4; }
+  body[data-variant="C"] .st-cur > .fl-c { box-shadow: inset 2px 0 0 var(--warn); }
+  #stepperC {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 58px; z-index: 40;
+    background: var(--bg2); border-top: 1px solid var(--line); display: none;
+    align-items: center; justify-content: center; gap: 0;
+  }
+  body[data-variant="C"] #stepperC { display: flex; }
+  .step { display: flex; align-items: center; cursor: pointer; }
+  .step .dot {
+    width: 26px; height: 26px; border-radius: 50%; border: 2px solid #334155;
+    display: flex; align-items: center; justify-content: center; font-size: 12px;
+    font-weight: 700; color: #93a5bd; background: #16213a;
+  }
+  .step.on .dot { background: var(--accent); border-color: var(--accent); color: #06283f; }
+  .step .lab { font-size: 12px; color: #93a5bd; margin-left: 8px; margin-right: 4px; white-space: nowrap; }
+  .step.on .lab { color: #e0f2fe; }
+  .step .conn { width: 44px; height: 2px; background: #334155; margin: 0 6px; }
+  .step.on .conn, .step.done .conn { background: var(--accent); }
+  #sheet {
+    position: fixed; left: 0; right: 0; bottom: 58px; height: 300px; z-index: 35;
+    background: var(--bg2); border-top: 1px solid var(--line); border-radius: 16px 16px 0 0;
+    transform: translateY(100%); transition: transform .22s ease; display: none;
+  }
+  body[data-variant="C"] #sheet { display: block; }
+  body[data-variant="C"] #sheet.open { transform: translateY(0); }
+  #sheet .bubble { position: relative; height: 100%; overflow-y: auto; }
+  #overlayC {
+    position: fixed; inset: 0; z-index: 70; display: none;
+    background: rgba(4, 10, 20, .78); backdrop-filter: blur(3px);
+    align-items: center; justify-content: center;
+  }
+  body[data-variant="C"] #overlayC { display: flex; }
+  body[data-variant="C"] #overlayC.hidden { display: none; }
+  .oc-card {
+    width: 460px; background: var(--bg2); border: 1px solid #334155; border-radius: 16px;
+    padding: 26px 28px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .oc-card h1 { margin: 0 0 6px; font-size: 20px; }
+  .oc-card .pitch { color: #aab8cc; font-size: 13.5px; line-height: 1.6; margin: 0 0 16px; }
+  .oc-card ul { list-style: none; padding: 0; margin: 0 0 18px; }
+  .oc-card li {
+    display: flex; align-items: center; gap: 10px; padding: 9px 0;
+    border-top: 1px solid #1e293b; font-size: 13.5px; color: #c8d4e4;
+  }
+  .oc-card li .no {
+    width: 22px; height: 22px; border-radius: 50%; border: 1px solid #334155;
+    display: flex; align-items: center; justify-content: center; font-size: 11px;
+    color: var(--accent); flex-shrink: 0;
+  }
+  .oc-card li .meta { color: var(--dim); font-size: 11.5px; margin-left: auto; }
+  .oc-card button {
+    width: 100%; background: var(--accent); color: #06283f; border: none;
+    border-radius: 10px; padding: 11px; font-weight: 700; font-size: 14px; cursor: pointer;
+  }
+
+  /* ================= prototype switcher ================= */
+  #switcher {
+    position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 100; display: flex; align-items: center; gap: 4px;
+    background: #1c2a45; border: 1px solid #334a6b; border-radius: 999px;
+    padding: 4px 6px; box-shadow: 0 6px 20px rgba(0,0,0,.5);
+    font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  #switcher button {
+    background: none; border: none; color: #93c5fd; font-size: 17px; cursor: pointer;
+    padding: 2px 9px; border-radius: 999px; line-height: 1;
+  }
+  #switcher button:hover { background: #25375a; color: #fff; }
+  #switcher .lab { font-size: 12px; color: #aab8cc; padding: 0 8px; white-space: nowrap; }
+  #switcher .lab b { color: #e0f2fe; }
+  #switcher .hint { font-size: 10.5px; color: #5b7395; padding-left: 6px; }
+</style>
+</head>
+<body data-variant="A">
+<div id="layout">
+  <div class="row">
+    <main id="file-line"></main>
+    <aside id="rail"></aside>
+  </div>
+  <div id="tourA"></div>
+  <div id="minimap"><div class="track"></div></div>
+  <button id="beginBtn">Begin tour</button>
+  <div id="bubbleB"></div>
+  <div id="sheet"></div>
+  <div id="stepperC"></div>
+  <div id="overlayC"></div>
+</div>
+<div id="switcher">
+  <button id="prevV" title="previous variant">‹</button>
+  <span class="lab"><b id="vKey">A</b> — <span id="vName">Rail</span></span>
+  <button id="nextV" title="next variant">›</button>
+  <span class="hint">←/→</span>
+</div>
+
+<script type="text/plain" id="bw-src">
+/*
+ * Copyright (c) 2005 Topspin Communications.  All rights reserved.
+ * Copyright (c) 2006 Cisco Systems.  All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 /*
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
@@ -1285,3 +1602,485 @@ int main(int argc, char *argv[])
         return rc;
     }
 }
+
+</script>
+<script>
+"use strict";
+/* ============================================================
+   PROTOTYPE APP — tour shell feel test (ticket #22)
+   ============================================================ */
+
+/* ---------- source ---------- */
+const SRC = document.getElementById("bw-src").textContent.replace(/^\n/, "");
+
+/* ---------- tokenizer (hand-rolled, C) ---------- */
+const KW = new Set(("auto break case char const continue default do double else enum extern " +
+  "float for goto if inline int long register restrict return short signed sizeof static " +
+  "struct switch typedef union unsigned void volatile while").split(" "));
+const TYPES = new Set(("uint32_t uint64_t uint8_t uint16_t int8_t int16_t int32_t int64_t " +
+  "size_t ssize_t bool FILE ibv_context ibv_pd ibv_mr ibv_cq ibv_qp ibv_wc ibv_send_wr ibv_sge " +
+  "ibv_gid ibv_port_attr ibv_device ibv_qp_type ibv_wr struct timespec timeval socklen_t").split(" "));
+
+function tokenize(src) {
+  const lines = []; let i = 0, n = src.length, inBlock = false;
+  let toks = [], text = "";
+  function flush() { lines.push({ toks, text }); toks = []; text = ""; }
+  while (i < n) {
+    const c = src[i];
+    if (c === "\n") { flush(); i++; continue; }
+    if (inBlock) {
+      if (c === "*" && src[i + 1] === "/") { toks.push({ t: "com", s: "*/" }); text += "*/"; i += 2; inBlock = false; }
+      else { toks.push({ t: "com", s: c }); text += c; i++; }
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "/") {
+      let j = i; while (j < n && src[j] !== "\n") j++;
+      const s = src.slice(i, j); toks.push({ t: "com", s }); text += s; i = j; continue;
+    }
+    if (c === "/" && src[i + 1] === "*") {
+      toks.push({ t: "com", s: "/*" }); text += "/*"; i += 2; inBlock = true; continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1, s = c;
+      while (j < n) {
+        const d = src[j]; s += d; j++;
+        if (d === "\\" && j < n) { s += src[j]; j++; continue; }
+        if (d === c) break;
+      }
+      toks.push({ t: "str", s }); text += s; i = j; continue;
+    }
+    if (c === "#") {
+      let j = i; while (j < n && src[j] !== "\n") j++;
+      const s = src.slice(i, j); toks.push({ t: "pp", s }); text += s; i = j; continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i;
+      while (j < n && /[0-9a-fA-FxXoObBuUlL.]/.test(src[j])) j++;
+      const s = src.slice(i, j); toks.push({ t: "num", s }); text += s; i = j; continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
+      const w = src.slice(i, j);
+      toks.push({ t: KW.has(w) ? "kw" : TYPES.has(w) ? "type" : "id", s: w });
+      text += w; i = j; continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (["->", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "++", "--", "/*"].includes(two) && two !== "/*") {
+      toks.push({ t: "id", s: two }); text += two; i += 2; continue;
+    }
+    toks.push({ t: "id", s: c }); text += c; i++;
+  }
+  flush();
+  return lines;
+}
+const LINES = tokenize(SRC);
+
+/* ---------- stations (data model: multi-valued tags, line ranges) ---------- */
+const STATIONS = [
+  {
+    id: "counts", title: "The counts table", type: "constant", tags: ["measurement", "data path"],
+    lines: [111, 122],
+    blocks: [
+      { k: "lead", t: "The ex1 converged counts: how many WRITEs make up each size's measured batch." },
+      { k: "p", t: "<strong>What.</strong> One entry per size of the sweep (2⁰…2²⁰, ascending). <code>MSG_COUNTS[i]</code> is the size 2^i Timed batch; <code>WARMUP_COUNTS[i]</code> is the Warmup batch pipelined ahead of it." },
+      { k: "p", t: "<strong>Why.</strong> These are ex1's convergence numbers, verbatim: each count makes the batch long enough that variance between doubled counts is under 1%, but short enough that a full 21-size sweep fits in lab time. They are a converged table, not a formula — the row comments make the size mapping visible at a glance." },
+      { k: "predict", q: "Why does the 1 B entry (1,310,720) dwarf every other count?", a: "A 1 B WRITE's cost is dominated by the wire-bound round trip of the message itself. It takes ~1.3M of them to accumulate a stable number — the count is what makes the measurement measurable." },
+      { k: "watch", t: "Both tables sit under <code>SWEEP_SIZES 21</code> and <code>CTRL_POOL_DEPTH 32</code> on purpose: 21 sizes × one control pair each — the 32-deep control receive pool covers a full sweep." },
+      { k: "xlink", refs: ["WARMUP_COUNTS", "SWEEP_SIZES", "bw_client_bench", "CTRL_POOL_DEPTH"] }
+    ]
+  },
+  {
+    id: "dest", title: "struct bw_dest", type: "struct", tags: ["handshake", "resources"],
+    lines: [202, 211],
+    blocks: [
+      { k: "lead", t: "The decoded handshake: everything one side needs to reach the other's QP and memory." },
+      { k: "p", t: "<strong>What.</strong> Four QP-address fields — <code>lid</code>, <code>qpn</code>, <code>psn</code>, <code>gid</code> — plus, server-side only, <code>buf_addr</code> and <code>rkey</code>, the registered buffer's address and key." },
+      { k: "p", t: "<strong>How.</strong> Both directions carry the four address fields. The memory keys are the server's to give: the server fills them, the client reads them, and on the client's own copy they stay zero." },
+      { k: "predict", q: "Why are buf_addr / rkey zero on the client?", a: "The server never touches client memory: RDMA WRITE is one-sided — the client is the only writer — so the client's buffer needs no addressable keys. Zero there is a statement, not an address." },
+      { k: "watch", t: "The client's copy is still typed <code>struct bw_dest</code> — reading <code>buf_addr</code> off it is a bug, not a zero meaning “anywhere”." },
+      { k: "xlink", refs: ["DEST_FMT", "bw_parse_dest", "bw_exch_dest_client", "bw_exch_dest_server"] }
+    ]
+  },
+  {
+    id: "poll", title: "bw_poll_until", type: "function", tags: ["completions", "control"],
+    lines: [775, 809],
+    blocks: [
+      { k: "lead", t: "The completion-reaping loop both roles share: poll one CQE at a time until the completion being waited for arrives." },
+      { k: "p", t: "<strong>How.</strong> <code>for(;;)</code> — poll 1 CQE. Nothing completed → check the 10 s deadline, loop. One completed → <code>bw_wc_bad()</code> verifies the status and the allowed wr_id set; if it's <code>want</code>, stop. Completions in <code>pass</code> are consumed and ignored; anything else is a protocol error." },
+      { k: "predict", q: "Why does pass matter — why not stop at the first completion?", a: "The CQ is shared: while the client waits for the ack, its done-send and data completions pile up in the same CQ. They must be drained, not mistaken for the ack. That routing-by-wr_id is the Poll loop's defining discipline." },
+      { k: "p", t: "<strong>Why.</strong> The run waits in exactly two places — the done on the server, the ack on the client — and both need the same deadline discipline: a dead peer must not hang a course node until the verify script's own timeout fires." },
+      { k: "watch", t: "Poll returning 0 is <em>not</em> an error — it just means nothing completed yet. But a completion outside <code>pass | want</code> means the exchange desynchronized, and <code>bw_wc_bad()</code> names the offending wr_id so the culprit is identifiable." },
+      { k: "xlink", refs: ["bw_recv_ctrl", "bw_wc_bad", "bw_refill", "CTRL_POLL_TIMEOUT_SEC"] }
+    ]
+  },
+  {
+    id: "refill", title: "bw_refill", type: "function", tags: ["data path", "pipeline"],
+    lines: [868, 888],
+    blocks: [
+      { k: "lead", t: "The refill discipline: reclaim only the CQEs that are ready, return immediately, let the caller repost — the SQ never empties and the NIC never idles." },
+      { k: "p", t: "<strong>How.</strong> While the window is full (<code>outstanding ≥ window</code>) — or the device-clamped depth is about to be (<code>outstanding + k ≥ sq_depth</code>) — drain just the completions that are ready, each accounting for exactly K WRs, then hand control back so the caller reposts." },
+      { k: "diagram", id: "refill" },
+      { k: "predict", q: "Why exactly K WRs per CQE — why not one?", a: "Only every K-th WR of the stream is signaled (Signal interval), and RC completions are in-order. Each CQE therefore accounts for the K WRs since the previous one — nothing is lost, nothing double-counted." },
+      { k: "watch", t: "The final list's CQE is never reclaimed here: no list is posted after it, so the refill never runs again — that CQE stays in the CQ for the ack wait to consume (it precedes the ack, ADR-0003)." },
+      { k: "xlink", refs: ["bw_post_writes", "bw_client_bench", "bw_data_state", "WINDOW_DEFAULT", "SIGNAL_INTERVAL_DEFAULT"] }
+    ]
+  }
+];
+const ROUTE = ["counts", "dest", "poll", "refill"];   // tour order (ramp), ≠ file order
+const SNAME = { counts: "counts table", dest: "bw_dest", poll: "bw_poll_until", refill: "bw_refill" };
+
+/* ---------- diagram (authored fresh, inline SVG) ---------- */
+const DIAGRAMS = {
+  refill: `
+  <svg viewBox="0 0 680 252" role="img" aria-label="The windowed pipeline: WRs stream into the send queue; every K-th is signaled and completes into the CQ; the refill reclaims K per CQE and reposts.">
+    <rect x="20" y="42" width="180" height="166" rx="10" fill="#0d1b2e" stroke="#38bdf8"/>
+    <text x="26" y="30" font-size="12" fill="#93c5fd">SQ — send queue (depth = W + QP_SLACK)</text>
+    <g font-size="10" fill="#e0f2fe" text-anchor="middle">
+      <rect x="38" y="60" width="17" height="128" rx="3" fill="#1e3a5f"/>
+      <rect x="59" y="60" width="17" height="128" rx="3" fill="#1e3a5f"/>
+      <rect x="80" y="60" width="17" height="128" rx="3" fill="#1e3a5f"/>
+      <rect x="101" y="60" width="17" height="128" rx="3" fill="#38bdf8" opacity="0.9"/><text x="109" y="50" fill="#7dd3fc">K</text>
+      <rect x="122" y="60" width="17" height="128" rx="3" fill="#1e3a5f"/>
+      <rect x="143" y="60" width="17" height="128" rx="3" fill="#1e3a5f"/>
+      <rect x="164" y="60" width="17" height="128" rx="3" fill="#38bdf8" opacity="0.9"/><text x="172" y="50" fill="#7dd3fc">K</text>
+    </g>
+    <path d="M38 206 L38 218 L122 218 L122 206" fill="none" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="80" y="236" font-size="11" fill="#fbbf24" text-anchor="middle">window W — outstanding &lt; W</text>
+    <line x1="200" y1="120" x2="322" y2="120" stroke="#e2e8f0" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="205" y="106" font-size="11" fill="#cbd5e1">RDMA WRITE — every K-th signaled</text>
+    <rect x="330" y="96" width="140" height="48" rx="8" fill="#0d1b2e" stroke="#34d399"/>
+    <text x="342" y="116" font-size="11" fill="#a7f3d0">server buffer</text>
+    <text x="342" y="132" font-size="10" fill="#6ee7b7">addr + rkey (from bw_dest)</text>
+    <line x1="400" y1="144" x2="400" y2="166" stroke="#e2e8f0" stroke-width="1.5" marker-end="url(#ah)"/>
+    <rect x="330" y="166" width="140" height="48" rx="8" fill="#0d1b2e" stroke="#f472b6"/>
+    <text x="342" y="186" font-size="11" fill="#fbcfe8">CQ — completions</text>
+    <text x="342" y="202" font-size="10" fill="#f9a8d4">one CQE per K WRs, in order</text>
+    <path d="M330 190 H 262 V 68 H 200" fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ah)"/>
+    <text x="266" y="184" font-size="10" fill="#fbbf24">refill</text>
+    <text x="206" y="58" font-size="10" fill="#fbbf24">reclaim K per CQE → repost</text>
+    <defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#e2e8f0"/></marker></defs>
+  </svg>
+  <figcaption>The windowed pipeline (ADR-0002): WRs stream into the SQ; only the K-th is signaled, so each CQE accounts for exactly K WRs; the refill reclaims just what's ready and the caller reposts — the SQ never empties.</figcaption>`
+};
+
+/* ---------- DOM refs ---------- */
+const fileEl = document.getElementById("file-line");
+const rail = document.getElementById("rail");
+const bubbleB = document.getElementById("bubbleB");
+const sheet = document.getElementById("sheet");
+const tourA = document.getElementById("tourA");
+const minimap = document.getElementById("minimap");
+const stepperC = document.getElementById("stepperC");
+const overlayC = document.getElementById("overlayC");
+const beginBtn = document.getElementById("beginBtn");
+
+/* ---------- render the file line ---------- */
+const lineEls = [];           // line number -> element
+const stOfLine = {};          // line number -> station id
+const startsOf = {};          // station id -> start line
+const lineCount = LINES.length;
+STATIONS.forEach(s => {
+  for (let l = s.lines[0]; l <= s.lines[1]; l++) stOfLine[l] = s.id;
+  startsOf[s.id] = s.lines[0];
+});
+{
+  const frag = document.createDocumentFragment();
+  LINES.forEach((ln, idx) => {
+    const div = document.createElement("div");
+    div.className = "fl-line";
+    div.dataset.line = idx + 1;
+    const g = document.createElement("div");
+    g.className = "fl-g"; g.textContent = idx + 1;
+    const c = document.createElement("div");
+    c.className = "fl-c";
+    for (const t of ln.toks) {
+      const s = document.createElement("span");
+      s.className = "tk " + t.t; s.textContent = t.s;
+      c.appendChild(s);
+    }
+    div.appendChild(g); div.appendChild(c);
+    if (stOfLine[idx + 1] && startsOf[stOfLine[idx + 1]] === idx + 1) div.classList.add("st-start");
+    lineEls[idx + 1] = div;
+    frag.appendChild(div);
+  });
+  fileEl.appendChild(frag);
+}
+
+/* ---------- state ---------- */
+const state = { variant: "A", open: null, cur: null, bubbleAnchor: null };
+const VARIANTS = { A: "Rail", B: "Float", C: "Deck" };
+
+/* ---------- block renderer (light-skeleton voice) ---------- */
+function blockHTML(b) {
+  switch (b.k) {
+    case "lead": return `<p class="b-lead">${b.t}</p>`;
+    case "p": return `<p>${b.t}</p>`;
+    case "watch": return `<div class="b-watch">⚠ ${b.t}</div>`;
+    case "predict":
+      return `<div class="b-pred"><p class="q">Predict — ${b.q}</p>` +
+        `<button class="rev">Reveal</button><p class="a hidden">${b.a}</p></div>`;
+    case "xlink":
+      return `<div class="b-x"><span>Cross-links</span>${b.refs.map(r => `<span class="xchip">${r}</span>`).join("")}</div>`;
+    case "diagram": return `<figure class="b-diag">${DIAGRAMS[b.id]}</figure>`;
+    default: return "";
+  }
+}
+function stationHTML(id) {
+  const s = STATIONS.find(x => x.id === id);
+  const pos = ROUTE.indexOf(id);
+  const typeLabel = s.type === "constant" ? "constant" : s.type;
+  return `<div class="bubble">
+    <h2>${s.title}</h2>
+    <div class="b-sub"><span class="typ">${typeLabel}</span>` +
+    s.tags.map(t => `<span class="tag">${t}</span>`).join("") +
+    `<span style="margin-left:6px">${s.lines[0]}–${s.lines[1]}</span></div>
+    ${s.blocks.map(blockHTML).join("")}
+    <div class="b-nav">
+      <button data-nav="prev">← ${pos > 0 ? SNAME[ROUTE[pos - 1]] : "…"}</button>
+      <button data-nav="next">${pos < ROUTE.length - 1 ? SNAME[ROUTE[pos + 1]] : "Finish"} →</button>
+    </div>
+  </div>`;
+}
+function placeholderHTML() {
+  return `<div class="b-placeholder">
+    <h3>Click any line to explain it</h3>
+    <p>Every line is owned by a station. Four sample stations are live; the rest of the file is owned by stations the partition ticket (#24) will cut.</p>
+    <div class="slist">
+      ${ROUTE.map((id, i) => {
+        const s = STATIONS.find(x => x.id === id);
+        return `<div class="sitem" data-open="${id}"><b>${i + 1}. ${s.title}</b>
+          <div class="meta">${s.type} · lines ${s.lines[0]}–${s.lines[1]} · ${s.tags.join(" / ")}</div></div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+/* ---------- highlight updates ---------- */
+function applyHighlights() {
+  const { open, cur } = state;
+  lineEls.forEach((el, l) => {
+    el.classList.remove("st-open", "st-cur");
+    const st = stOfLine[l];
+    if (open && st === open) el.classList.add("st-open");
+    if (cur && st === cur && st !== open) el.classList.add("st-cur");
+  });
+  if (state.variant === "B") {
+    // spotlight: dim everything outside the open station
+    fileEl.querySelectorAll(".fl-line").forEach(el => {
+      el.classList.toggle("dim", !!open && !el.classList.contains("st-open"));
+    });
+  }
+}
+function setPreviewLine(l) {
+  lineEls.forEach((el, n) => el.classList.toggle("st-preview", n === l));
+}
+
+/* ---------- scrollspy ---------- */
+function spy() {
+  const rect = fileEl.getBoundingClientRect();
+  const el = document.elementFromPoint(rect.left + 24, rect.top + rect.height / 2);
+  const lineEl = el ? el.closest(".fl-line") : null;
+  const n = lineEl ? +lineEl.dataset.line : null;
+  const st = n ? stOfLine[n] : null;
+  if (st !== state.cur) { state.cur = st; applyHighlights(); paintTour(); }
+}
+let spyTimer = null;
+fileEl.addEventListener("scroll", () => {
+  if (spyTimer) return;
+  spyTimer = requestAnimationFrame(() => { spyTimer = null; spy(); });
+});
+
+/* ---------- open / close ---------- */
+function openStation(id, opts = {}) {
+  const s = STATIONS.find(x => x.id === id);
+  state.open = id; state.cur = id;
+  applyHighlights(); paintTour();
+  if (!opts.noScroll) {
+    fileEl.scrollTop = lineEls[s.lines[0]].offsetTop - Math.min(120, fileEl.clientHeight / 3);
+  }
+  if (state.variant === "A") {
+    rail.innerHTML = stationHTML(id);
+  } else if (state.variant === "B") {
+    showBubbleB(id);
+  } else {
+    sheet.innerHTML = stationHTML(id);
+    sheet.classList.add("open");
+  }
+  if (opts.fromClick && state.variant === "B") {
+    state.bubbleAnchor = opts.lineEl;
+  }
+}
+function closeStation() {
+  state.open = null;
+  applyHighlights(); paintTour();
+  if (state.variant === "A") rail.innerHTML = placeholderHTML();
+  else if (state.variant === "B") bubbleB.style.display = "none";
+  else sheet.classList.remove("open");
+}
+function showBubbleB(id) {
+  const html = stationHTML(id);
+  bubbleB.innerHTML = html;
+  bubbleB.style.display = "block";
+  if (state.bubbleAnchor) {
+    const r = state.bubbleAnchor.getBoundingClientRect();
+    const x = Math.min(r.right + 14, window.innerWidth - 372);
+    const y = Math.max(12, Math.min(r.top - 40, window.innerHeight - Math.min(320, bubbleB.offsetHeight) - 20));
+    bubbleB.style.left = x + "px"; bubbleB.style.top = y + "px";
+  } else {
+    bubbleB.style.left = "calc(100% - 380px)"; bubbleB.style.top = "90px";
+  }
+}
+
+/* ---------- click anywhere to explain ---------- */
+fileEl.addEventListener("mouseover", e => {
+  const l = e.target.closest(".fl-line");
+  setPreviewLine(l ? +l.dataset.line : null);
+});
+fileEl.addEventListener("mouseout", () => setPreviewLine(null));
+fileEl.addEventListener("click", e => {
+  const l = e.target.closest(".fl-line");
+  if (!l) return;
+  const n = +l.dataset.line;
+  const st = stOfLine[n];
+  if (!st) {
+    if (state.variant === "A") { rail.innerHTML = `<div class="b-placeholder"><h3>Line ${n}</h3><p>No sample station owns this line yet — the partition ticket (#24) cuts them.</p></div>`; }
+    else if (state.variant === "B") { /* tiny inline note */ l.classList.add("st-preview"); }
+    else { sheet.innerHTML = `<div class="bubble"><h2>Line ${n}</h2><p>No sample station owns this line yet — the partition ticket (#24) cuts them.</p></div>`; sheet.classList.add("open"); }
+    return;
+  }
+  state.bubbleAnchor = l;
+  openStation(st, { fromClick: true, lineEl: l, noScroll: true });
+});
+
+/* ---------- tour line painters ---------- */
+function paintTour() {
+  if (state.variant === "A") paintTourA();
+  else if (state.variant === "B") paintMinimap();
+  else paintStepper();
+}
+function paintTourA() {
+  const cur = state.cur || state.open;
+  const pos = cur ? ROUTE.indexOf(cur) : -1;
+  const next = pos >= 0 && pos < ROUTE.length - 1 ? ROUTE[pos + 1] : null;
+  tourA.innerHTML = `<button id="startBtn">▶ Start tour</button>` +
+    ROUTE.map((id, i) => {
+      const s = STATIONS.find(x => x.id === id);
+      const on = state.open === id ? " on" : "";
+      const isCur = cur === id && !on ? " cur" : "";
+      return `<button class="chip${on}${isCur}" data-open="${id}" title="lines ${s.lines[0]}–${s.lines[1]}"><span class="no">${i + 1}</span>${s.title}</button>`;
+    }).join("") +
+    `<span id="nextHint">next: <b>${next ? SNAME[next] : "—"}</b></span>`;
+}
+function paintMinimap() {
+  const cur = state.cur || state.open;
+  const track = minimap.querySelector(".track");
+  const existing = track.querySelectorAll(".tick");
+  if (existing.length !== ROUTE.length) {
+    track.innerHTML = ROUTE.map(id => `<div class="tick s${ROUTE.indexOf(id) + 1}" data-open="${id}" title="${STATIONS.find(x => x.id === id).title} (lines ${STATIONS.find(x => x.id === id).lines[0]}–${STATIONS.find(x => x.id === id).lines[1]})"></div>`).join("");
+  }
+  track.querySelectorAll(".tick").forEach(t => {
+    const id = t.dataset.open;
+    const s = STATIONS.find(x => x.id === id);
+    const mid = (s.lines[0] + s.lines[1]) / 2;
+    t.style.top = ((mid / lineCount) * 100) + "%";
+    t.classList.toggle("cur", cur === id);
+  });
+}
+function paintStepper() {
+  const cur = state.cur || state.open;
+  const pos = cur ? ROUTE.indexOf(cur) : -1;
+  stepperC.innerHTML = ROUTE.map((id, i) => {
+    const s = STATIONS.find(x => x.id === id);
+    const on = state.open === id ? " on" : "";
+    const done = i < pos ? " done" : "";
+    return `<div class="step${on}${done}" data-open="${id}" title="lines ${s.lines[0]}–${s.lines[1]}">
+      <span class="dot">${i + 1}</span><span class="lab">${s.title}</span>` +
+      (i < ROUTE.length - 1 ? `<span class="conn"></span>` : "") + `</div>`;
+  }).join("");
+}
+
+/* ---------- tour navigation ---------- */
+document.addEventListener("click", e => {
+  const openBtn = e.target.closest("[data-open]");
+  if (openBtn) { openStation(openBtn.dataset.open); return; }
+  if (e.target.closest("#startBtn") || e.target.closest("#beginBtn")) { openStation(ROUTE[0]); return; }
+  if (e.target.closest("#startTourOverlay")) { overlayC.classList.add("hidden"); openStation(ROUTE[0]); return; }
+  const nav = e.target.closest("[data-nav]");
+  if (nav) {
+    const cur = state.open ? ROUTE.indexOf(state.open) : -1;
+    const d = nav.dataset.nav === "next" ? 1 : -1;
+    const npos = Math.min(ROUTE.length - 1, Math.max(0, cur + d));
+    openStation(ROUTE[npos]);
+  }
+  if (e.target.closest(".rev")) {
+    e.target.closest(".b-pred").querySelector(".a").classList.remove("hidden");
+    e.target.style.display = "none";
+  }
+  if (e.target.closest("#closeBubble")) closeStation();
+  if (state.variant === "B" && state.open && !e.target.closest("#bubbleB") &&
+      !e.target.closest("#file-line") && !e.target.closest("#minimap") &&
+      !e.target.closest("#beginBtn") && !e.target.closest("#switcher")) {
+    closeStation();
+  }
+});
+
+/* ---------- entry feel ---------- */
+beginBtn.addEventListener("click", () => openStation(ROUTE[0]));
+overlayC.innerHTML = `<div class="oc-card">
+  <h1>bw.c — guided tour</h1>
+  <p class="pitch">A two-line tour of the Verbs throughput benchmark: the <b>file line</b> (code order — the spatial map) and the <b>tour line</b> below (the route). Walk the sample to feel the shell: click any line to explain it, watch the highlight follow you.</p>
+  <ul>
+    ${ROUTE.map((id, i) => {
+      const s = STATIONS.find(x => x.id === id);
+      return `<li><span class="no">${i + 1}</span> ${s.title}<span class="meta">${s.type} · ${s.lines[0]}–${s.lines[1]}</span></li>`;
+    }).join("")}
+  </ul>
+  <button id="startTourOverlay">Start the tour</button>
+</div>`;
+
+/* ---------- variant switcher ---------- */
+function setVariant(v, preserveState = true) {
+  v = VARIANTS[v] ? v : "A";
+  state.variant = v;
+  document.body.dataset.variant = v;
+  document.getElementById("vKey").textContent = v;
+  document.getElementById("vName").textContent = VARIANTS[v];
+  if (v === "A") rail.innerHTML = state.open ? stationHTML(state.open) : placeholderHTML();
+  if (v === "B") { if (state.open) showBubbleB(state.open); else bubbleB.style.display = "none"; }
+  if (v === "C") { sheet.innerHTML = state.open ? stationHTML(state.open) : ""; sheet.classList.toggle("open", !!state.open); }
+  overlayC.classList.toggle("hidden", v !== "C");
+  paintTour(); applyHighlights();
+  if (!preserveState) { state.open = null; closeStation(); }
+}
+function cycle(dir) {
+  const keys = Object.keys(VARIANTS);
+  const i = keys.indexOf(state.variant);
+  const next = keys[(i + dir + keys.length) % keys.length];
+  setVariant(next);
+  history.replaceState(null, "", "?variant=" + next);
+}
+document.getElementById("prevV").addEventListener("click", () => cycle(-1));
+document.getElementById("nextV").addEventListener("click", () => cycle(1));
+document.addEventListener("keydown", e => {
+  if (e.target.closest("input,textarea,[contenteditable]")) return;
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    cycle(e.key === "ArrowRight" ? 1 : -1);
+  }
+});
+
+/* ---------- bootstrap ---------- */
+{
+  const want = new URLSearchParams(location.search).get("variant") || "A";
+  state.variant = want; document.body.dataset.variant = want;
+  document.getElementById("vKey").textContent = want;
+  document.getElementById("vName").textContent = VARIANTS[want];
+  rail.innerHTML = placeholderHTML();
+  paintMinimap();
+  paintStepper();
+  spy();
+}
+</script>
+</body>
+</html>
