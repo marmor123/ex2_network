@@ -25,8 +25,8 @@
  *
  * Device init and handshake: the two 1 MB buffer registrations (the
  * server's with remote-write permission); QP create → init → RTR → RTS
- * with the port's active MTU; the TCP exchange of LID/QPN/PSN/GID plus
- * the server's buffer addr/rkey.
+ * with the port's active MTU; the TCP exchange of LID/QPN/PSN plus the
+ * server's buffer addr/rkey.
  *
  * Adapted from the assignment's bw_template.c: the socket exchange is the
  * template's, extended with the server's buffer address and rkey; the QP
@@ -133,14 +133,14 @@ typedef char bw_params_sane[(SIGNAL_INTERVAL <= WINDOW) &&
 #define MAX_INLINE_DATA_DECLARE 1024
 
 /* Fixed-size handshake message, both directions. The client's message
- * carries only the first four fields (addr/rkey are the server's to give). */
+ * carries only the first three fields (addr/rkey are the server's to give). */
 #define DEST_MSG_LEN 128
 
 /* The handshake's wire format, kept in one place so the send and parse
- * sides cannot drift: lid:qpn:psn:gid, plus :addr:rkey on the server. */
-#define DEST_FMT         "%04x:%06x:%06x:%s"
+ * sides cannot drift: lid:qpn:psn, plus :addr:rkey on the server. */
+#define DEST_FMT         "%04x:%06x:%06x"
 #define DEST_FMT_SERVER  DEST_FMT ":%" PRIx64 ":%x"
-#define DEST_FMT_PARSE   "%x:%x:%x:%32[0-9a-fA-F]:%" SCNx64 ":%x"
+#define DEST_FMT_PARSE   "%x:%x:%x:%" SCNx64 ":%x"
 
 enum {
     /* Control receive: the done on the server, the ack on the client. All
@@ -178,33 +178,11 @@ struct bw_dest {
     int lid;
     int qpn;
     int psn;
-    union ibv_gid gid;
     /* Server side only: buffer address and rkey for the client's RDMA
      * WRITEs. Zero on the client (the server never touches client memory). */
     uint64_t buf_addr;
     uint32_t rkey;
 };
-
-void wire_gid_to_gid(const char *wgid, union ibv_gid *gid)
-{
-    char tmp[9];
-    uint32_t v32;
-    int i;
-
-    for (tmp[8] = 0, i = 0; i < 4; ++i) {
-        memcpy(tmp, wgid + i * 8, 8);
-        sscanf(tmp, "%x", &v32);
-        *(uint32_t *)(&gid->raw[i * 4]) = ntohl(v32);
-    }
-}
-
-void gid_to_wire_gid(const union ibv_gid *gid, char wgid[])
-{
-    int i;
-
-    for (i = 0; i < 4; ++i)
-        sprintf(&wgid[i * 8], "%08x", htonl(*(uint32_t *)(gid->raw + i * 4)));
-}
 
 /* Loop until len bytes move or the stream ends: the handshake messages are
  * fixed-size, and a short read would break the parse. */
@@ -237,35 +215,32 @@ static int bw_write_full(int fd, const void *buf, size_t len)
 static struct bw_dest *bw_parse_dest(const char *msg, int expect_addr)
 {
     struct bw_dest *dest = calloc(1, sizeof *dest);
-    char gid[33];
     int n;
 
     if (!dest)
         return NULL;
 
-    /* The server's message carries all six fields; the client's carries the
-     * first four (addr/rkey stay zero). The client expects the server's
-     * addr/rkey — its RDMA WRITEs land there — so it requires all six; a
+    /* The server's message carries all five fields; the client's carries the
+     * first three (addr/rkey stay zero). The client expects the server's
+     * addr/rkey — its RDMA WRITEs land there — so it requires all five; a
      * truncated server message must not pass with addr/rkey zero. */
     n = sscanf(msg, DEST_FMT_PARSE,
-               &dest->lid, &dest->qpn, &dest->psn, gid,
+               &dest->lid, &dest->qpn, &dest->psn,
                &dest->buf_addr, &dest->rkey);
-    if (n < 4 || (expect_addr && n < 6)) {
+    if (n < 3 || (expect_addr && n < 5)) {
         free(dest);
         return NULL;
     }
 
-    wire_gid_to_gid(gid, &dest->gid);
     return dest;
 }
 
 static int bw_connect_qp(struct bw_context *ctx, int port, int my_psn,
-                         enum ibv_mtu mtu,
-                         struct bw_dest *dest, int sgid_idx)
+                         struct bw_dest *dest)
 {
     struct ibv_qp_attr attr = {
             .qp_state		= IBV_QPS_RTR,
-            .path_mtu		= mtu,
+            .path_mtu		= ctx->portinfo.active_mtu,
             .dest_qp_num		= dest->qpn,
             .rq_psn			= dest->psn,
             .max_dest_rd_atomic	= 1,
@@ -279,16 +254,6 @@ static int bw_connect_qp(struct bw_context *ctx, int port, int my_psn,
             }
     };
 
-    /* GRH addressing is used iff the remote advertised a nonzero GID and we
-     * have a GID index of our own; a remote GID with no local index (-g on
-     * one side only) therefore degrades to LID-based addressing — the course
-     * fabric's normal mode — instead of failing RTR on sgid_index = -1. */
-    if (dest->gid.global.interface_id && sgid_idx >= 0) {
-        attr.ah_attr.is_global = 1;
-        attr.ah_attr.grh.hop_limit = 1;
-        attr.ah_attr.grh.dgid = dest->gid;
-        attr.ah_attr.grh.sgid_index = sgid_idx;
-    }
     if (ibv_modify_qp(ctx->qp, &attr,
             IBV_QP_STATE              |
             IBV_QP_AV                 |
@@ -334,7 +299,6 @@ static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
     int n;
     int sockfd = -1;
     struct bw_dest *rem_dest = NULL;
-    char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
         return NULL;
@@ -366,9 +330,8 @@ static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
         return NULL;
     }
 
-    gid_to_wire_gid(&my_dest->gid, gid);
     memset(msg, 0, sizeof msg);
-    sprintf(msg, DEST_FMT, my_dest->lid, my_dest->qpn, my_dest->psn, gid);
+    sprintf(msg, DEST_FMT, my_dest->lid, my_dest->qpn, my_dest->psn);
     if (!bw_write_full(sockfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
         goto out;
@@ -399,10 +362,8 @@ out:
 }
 
 static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
-                                           int ib_port, enum ibv_mtu mtu,
-                                           int port,
-                                           const struct bw_dest *my_dest,
-                                           int sgid_idx)
+                                           int ib_port, int port,
+                                           const struct bw_dest *my_dest)
 {
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -415,7 +376,6 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
     int n;
     int sockfd = -1, connfd;
     struct bw_dest *rem_dest = NULL;
-    char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
         return NULL;
@@ -470,7 +430,7 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
         goto out;
     }
 
-    if (bw_connect_qp(ctx, ib_port, my_dest->psn, mtu, rem_dest, sgid_idx)) {
+    if (bw_connect_qp(ctx, ib_port, my_dest->psn, rem_dest)) {
         fprintf(stderr, "Couldn't connect to remote QP\n");
         free(rem_dest);
         rem_dest = NULL;
@@ -479,10 +439,9 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
 
     /* Send our address plus the buffer addr/rkey the client needs for its
      * RDMA WRITEs. */
-    gid_to_wire_gid(&my_dest->gid, gid);
     memset(msg, 0, sizeof msg);
     sprintf(msg, DEST_FMT_SERVER,
-            my_dest->lid, my_dest->qpn, my_dest->psn, gid,
+            my_dest->lid, my_dest->qpn, my_dest->psn,
             my_dest->buf_addr, my_dest->rkey);
     if (!bw_write_full(connfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
@@ -1121,11 +1080,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* LID-based addressing (the option-era -g is gone): the local GID stays
-     * all-zero, so the GRH path in bw_connect_qp never engages — the course
-     * fabric's normal mode. */
-    memset(&my_dest.gid, 0, sizeof my_dest.gid);
-
     my_dest.qpn = ctx->qp->qp_num;
     my_dest.psn = lrand48() & 0xffffff;
 
@@ -1138,16 +1092,14 @@ int main(int argc, char *argv[])
          * here — and nothing else beyond the template's QP address. */
         my_dest.buf_addr = (uint64_t) ctx->buf;
         my_dest.rkey = ctx->mr->rkey;
-        rem_dest = bw_exch_dest_server(ctx, IB_PORT, ctx->portinfo.active_mtu,
-                                       HANDSHAKE_PORT, &my_dest, -1);
+        rem_dest = bw_exch_dest_server(ctx, IB_PORT, HANDSHAKE_PORT, &my_dest);
     }
 
     if (!rem_dest)
         return 1;
 
     if (servername)
-        if (bw_connect_qp(ctx, IB_PORT, my_dest.psn, ctx->portinfo.active_mtu,
-                          rem_dest, -1))
+        if (bw_connect_qp(ctx, IB_PORT, my_dest.psn, rem_dest))
             return 1;
 
     /* The full sweep: the client streams the WRITEs of each size and
