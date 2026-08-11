@@ -1102,6 +1102,11 @@ int main(int argc, char *argv[])
      * drives one done SEND per size, the server acks each. Both sides
      * verify every sequence counter. */
     if (servername) {
+        printf("max_inline_data=%u sq_depth=%u active_mtu=%d\n",
+               ctx->max_inline_data,
+               ctx->sq_depth,
+               ctx->portinfo.active_mtu);
+
         if (bw_client_bench(ctx, rem_dest))
             return 1;
     } else {
