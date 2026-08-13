@@ -893,6 +893,46 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
+/* Parses a comma-separated list of exactly SWEEP_SIZES counts from the
+ * env var `name` into `out`; leaves `out` untouched (the caller's default
+ * stands) if `name` is unset. Temporary, for finding the optimal per-size
+ * benchmark count experimentally — delete once the numbers are baked into
+ * MSG_COUNTS (see docs/research/perf-experiments.md). */
+static int bw_parse_counts_env(const char *name, uint64_t *out)
+{
+    const char *val = getenv(name);
+    char *copy, *tok, *save;
+    int i = 0;
+
+    if (!val)
+        return 0;
+
+    copy = strdup(val);
+    if (!copy) {
+        fprintf(stderr, "%s: out of memory\n", name);
+        return 1;
+    }
+
+    for (tok = strtok_r(copy, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        if (i >= SWEEP_SIZES) {
+            fprintf(stderr, "%s: too many values, expected %d\n",
+                    name, SWEEP_SIZES);
+            free(copy);
+            return 1;
+        }
+        out[i++] = strtoull(tok, NULL, 0);
+    }
+    free(copy);
+
+    if (i != SWEEP_SIZES) {
+        fprintf(stderr, "%s: expected %d comma-separated values, got %d\n",
+                name, SWEEP_SIZES, i);
+        return 1;
+    }
+    return 0;
+}
+
 /* Client side of the full sweep: per size, the clock starts at the first
  * timed post and stops at the ack-receive completion (ADR-0003) — closed
  * by the done SEND. The done needs one free SQ slot: the refill exits
@@ -900,14 +940,21 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
  * at most K, so at most sq_depth - 1 — the slot is always free. The ack
  * wait passes the data and done-send completions through; the 21 acks
  * consume 21 of the 32 pre-posted control receive pool, never
- * refreshed. */
+ * refreshed. BW_BENCH_COUNTS (env var, 21 comma-separated values)
+ * overrides MSG_COUNTS per size — temporary, for finding the optimal
+ * count experimentally. */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
     struct ibv_send_wr *wrs;
     struct ibv_sge *sges;
+    uint64_t bench_counts[SWEEP_SIZES];
     uint32_t seq;
     int rc = 1;
+
+    memcpy(bench_counts, MSG_COUNTS, sizeof bench_counts);
+    if (bw_parse_counts_env("BW_BENCH_COUNTS", bench_counts))
+        return 1;
 
     wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
     sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
@@ -918,7 +965,7 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
-        uint64_t count = MSG_COUNTS[seq];
+        uint64_t count = bench_counts[seq];
         struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
