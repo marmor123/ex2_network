@@ -145,3 +145,77 @@ This is a middle ground: it satisfies the requirement to use warmup
 without claiming a benefit the measurements don't show at the other 15
 sizes. `WARMUP_COUNTS` is now baked in directly (no more
 `BW_WARMUP_COUNTS` env var — the sweep that produced this table is done).
+
+## Per-size benchmark count (`MSG_COUNTS`)
+
+**Hypothesis**: ex1's original counts table (carried into this RDMA
+benchmark verbatim, per the original header comment) was converged for
+ex1's TCP path, not this one, and predates the per-size warmup round
+above — worth re-converging now that both have changed. Convergence
+methodology (per `CONTEXT.md`): the smallest count where doubling it no
+longer changes throughput by more than 1%.
+
+**Change**: `MSG_COUNTS` replaced with a per-size re-converged table
+(commit that also removed the now-unneeded `BW_BENCH_COUNTS` env var —
+the sweep it supported is done).
+
+**Measured** (`sweep_benchcount.sh`, 10 runs per level, mlx-stud-01 ↔
+mlx-stud-02, avg Gbps; multipliers of the original ex1 table; run against
+the build with per-size warmup already in place):
+
+| size (B) | 0.125x | 0.25x | 0.5x | 1x | 2x |
+|---|---|---|---|---|---|
+| 1 | 0.04954 | 0.04954 | 0.04956 | 0.04953 | 0.04954 |
+| 2 | 0.09850 | 0.09882 | 0.09898 | 0.09899 | 0.09910 |
+| 4 | 0.19812 | 0.19820 | 0.19823 | 0.19823 | 0.19825 |
+| 8 | 0.39524 | 0.39591 | 0.39621 | 0.39610 | 0.39631 |
+| 16 | 0.79184 | 0.79247 | 0.79276 | 0.79280 | 0.79289 |
+| 32 | 1.53800 | 1.56100 | 1.57300 | 1.58000 | 1.58000 |
+| 64 | 2.63800 | 2.64000 | 2.64900 | 2.64900 | 2.65000 |
+| 128 | 3.59500 | 3.60500 | 3.61100 | 3.61100 | 3.61100 |
+| 256 | 5.80900 | 5.83000 | 5.84000 | 5.84000 | 5.84000 |
+| 512 | 6.25900 | 6.28100 | 6.29000 | 6.29000 | 6.29900 |
+| 1024 | 6.70500 | 6.59200 | 6.58300 | 6.56700 | 6.55800 |
+| 2048 | 34.37300 | 33.80700 | 33.65300 | 33.51600 | 33.43900 |
+| 4096 | 37.97700 | 38.06500 | 38.11000 | 38.13000 | 38.14400 |
+| 8192 | 37.52100 | 37.88200 | 38.05400 | 38.15000 | 38.18900 |
+| 16384 | 37.90900 | 38.08800 | 38.18400 | 38.23000 | 38.25000 |
+| 32768 | 38.11000 | 38.20200 | 38.25000 | 38.25500 | 38.28000 |
+| 65536 | 37.93100 | 38.12200 | 38.21000 | 38.24200 | 38.28000 |
+| 131072 | 37.97300 | 38.11300 | 38.21400 | 38.26000 | 38.28000 |
+| 262144 | 38.01100 | 38.12900 | 38.21700 | 38.26500 | 38.29000 |
+| 524288 | 38.16100 | 38.23000 | 38.26700 | 38.28000 | 38.30000 |
+| 1048576 | 38.17300 | 38.23400 | 38.27000 | 38.28800 | 38.29500 |
+
+**Important methodological note**: unlike warmup, message count is not a
+performance lever — Gbps is already normalized per message
+(`size * count * 8 / elapsed`), so the true achieved rate does not depend
+on count. Where small counts read *higher* (1024 B and 2048 B most
+visibly: +2.2% and +2.8% over the 2x reading), that is short-run bias —
+fixed per-round overhead and warmup carryover are a bigger share of a
+short timed window, inflating the computed rate — not a real speedup.
+Picking the count with the highest reported number would mean reporting
+that bias as if it were a result. The correct pick is the opposite: the
+*smallest* count already converged to the same reading the largest
+counts show (using the 2x reading, the most-diluted and therefore most
+accurate available, as the reference), i.e. **the standard convergence
+test** — the same logic `MSG_COUNTS` was originally chosen by, just
+re-run on this path.
+
+**Verdict: baked in per-size, ~6-8x fewer messages than ex1's table for
+17 of 21 sizes.** Convergence pick (smallest multiplier within 1% of the
+2x reading) per size:
+
+| size (B) | multiplier | old count | new count |
+|---|---|---|---|
+| 1, 2, 4, 8, 16, 64, 128, 256, 512, 4096, 16384–1048576 (16 sizes) | 0.125x | — | 1/8 of original |
+| 32 | 0.5x | 20480 | 10240 |
+| 1024 | 0.25x | 20480 | 5120 |
+| 2048 | 0.5x | 20480 | 10240 |
+| 8192 | 0.25x | 2560 | 640 |
+
+The four exceptions are the same sizes that showed real (non-noise)
+sensitivity in the warmup sweep too (1024/2048/8192 got nonzero warmup;
+32 sits right at the message-rate-bound → inline-copy transition) — the
+regime-boundary sizes are noisier and need more samples to converge,
+consistent with `docs/research/small-size-ceiling.md`/`inline-copy.md`.

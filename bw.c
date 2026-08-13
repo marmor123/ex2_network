@@ -4,9 +4,10 @@
  *
  * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
  * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
- * ex1's converged counts table (BW_BENCH_COUNTS overrides it per size).
- * Per size, a per-size warmup round (WARMUP_COUNTS, mostly 0 — chosen
- * from measurement, not applied uniformly, see
+ * a per-size counts table re-converged on this RDMA path with warmup in
+ * place (MSG_COUNTS; ex1's original TCP-path table is gone). Per size, a
+ * per-size warmup round (WARMUP_COUNTS, mostly 0 — chosen from
+ * measurement, not applied uniformly, see
  * docs/research/perf-experiments.md) runs untimed before the timed
  * benchmark round whose batch of RDMA WRITEs is clocked: K WRs posted
  * per ibv_post_send as a linked list (W=256, K=64 by default,
@@ -79,17 +80,23 @@
 #define CTRL_POOL_DEPTH (2 * SWEEP_SIZES)
 #define CTRL_MSG_LEN 64
 
-/* The ex1 converged counts table, verbatim: one entry per size of the
- * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
- * (throughput variance < 1% between doubled counts). BW_BENCH_COUNTS
- * (env var) can still override this per size, temporarily, while the
- * optimal count is being found (see docs/research/perf-experiments.md). */
+/* Per-size benchmark count, re-converged on this RDMA path with the
+ * per-size warmup round now in place (ex1's original table above was
+ * TCP-path convergence, carried forward unchanged until this point).
+ * Chosen as the smallest multiplier of the original ex1 table whose
+ * measured Gbps is within 1% of the largest-count (2x) reading — the
+ * most-diluted, most-accurate reading available — rather than whichever
+ * multiplier reports the highest number: a short run reads *higher* than
+ * the true rate (fixed per-round overhead and warmup carryover are a
+ * bigger share of a short timed window), so picking the top number would
+ * mean reporting that bias, not a real speedup. Full sweep table and
+ * rationale: docs/research/perf-experiments.md. */
 static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
-        1310720, 81920, 655360, 163840, 327680, /* 1B 2B 4B 8B 16B */
-        20480, 81920, 81920, 40960, 20480,      /* 32B 64B 128B 256B 512B */
-        20480, 20480, 20480, 2560, 2560,        /* 1KB 2KB 4KB 8KB 16KB */
-        2560, 640, 320, 160, 160,               /* 32KB 64KB 128KB 256KB 512KB */
-        80                                       /* 1MB */
+        163840, 10240, 81920, 20480, 40960,     /* 1B 2B 4B 8B 16B */
+        10240, 10240, 10240, 5120, 2560,        /* 32B 64B 128B 256B 512B */
+        5120, 10240, 2560, 640, 320,            /* 1KB 2KB 4KB 8KB 16KB */
+        320, 80, 40, 20, 20,                    /* 32KB 64KB 128KB 256KB 512KB */
+        10                                       /* 1MB */
 };
 
 /* Per-size warmup count: an untimed round of this many WRITEs immediately
@@ -923,46 +930,6 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* Parses a comma-separated list of exactly SWEEP_SIZES counts from the
- * env var `name` into `out`; leaves `out` untouched (the caller's default
- * stands) if `name` is unset. Temporary, for finding the optimal per-size
- * benchmark count experimentally — delete once the numbers are baked into
- * MSG_COUNTS (see docs/research/perf-experiments.md). */
-static int bw_parse_counts_env(const char *name, uint64_t *out)
-{
-    const char *val = getenv(name);
-    char *copy, *tok, *save;
-    int i = 0;
-
-    if (!val)
-        return 0;
-
-    copy = strdup(val);
-    if (!copy) {
-        fprintf(stderr, "%s: out of memory\n", name);
-        return 1;
-    }
-
-    for (tok = strtok_r(copy, ",", &save); tok;
-         tok = strtok_r(NULL, ",", &save)) {
-        if (i >= SWEEP_SIZES) {
-            fprintf(stderr, "%s: too many values, expected %d\n",
-                    name, SWEEP_SIZES);
-            free(copy);
-            return 1;
-        }
-        out[i++] = strtoull(tok, NULL, 0);
-    }
-    free(copy);
-
-    if (i != SWEEP_SIZES) {
-        fprintf(stderr, "%s: expected %d comma-separated values, got %d\n",
-                name, SWEEP_SIZES, i);
-        return 1;
-    }
-    return 0;
-}
-
 /* One post -> done -> ack round trip of `count` WRITEs of `size` bytes, on
  * a freshly-reset pipeline (bw_data_state does not survive a round). The
  * done needs one free SQ slot: the refill exits with at most
@@ -998,27 +965,19 @@ static int bw_run_round(struct bw_context *ctx, const struct bw_dest *dest,
 
 /* Client side of the full sweep: per size, the warmup round
  * (WARMUP_COUNTS, possibly 0) runs untimed, immediately followed by the
- * timed benchmark round whose clock starts at the first post and stops
- * at the ack-receive completion (ADR-0003). Both rounds always run, even
- * at warmup count 0 — a size can't skip its warmup round only on the
- * client, since the server never learns the counts and would desync
- * waiting for a done that never comes; the 42 acks (2 per size) consume
- * 42 of the pre-posted control receive pool, never refreshed.
- * BW_BENCH_COUNTS (env var, 21 comma-separated values) overrides
- * MSG_COUNTS per size — temporary, for finding the optimal count
- * experimentally. */
+ * timed benchmark round (MSG_COUNTS) whose clock starts at the first post
+ * and stops at the ack-receive completion (ADR-0003). Both rounds always
+ * run, even at warmup count 0 — a size can't skip its warmup round only
+ * on the client, since the server never learns the counts and would
+ * desync waiting for a done that never comes; the 42 acks (2 per size)
+ * consume 42 of the pre-posted control receive pool, never refreshed. */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
     struct ibv_send_wr *wrs;
     struct ibv_sge *sges;
-    uint64_t bench_counts[SWEEP_SIZES];
     uint32_t seq;
     int rc = 1;
-
-    memcpy(bench_counts, MSG_COUNTS, sizeof bench_counts);
-    if (bw_parse_counts_env("BW_BENCH_COUNTS", bench_counts))
-        return 1;
 
     wrs = calloc(ctx->signal_interval, sizeof *wrs);
     sges = calloc(ctx->signal_interval, sizeof *sges);
@@ -1029,7 +988,7 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
-        uint64_t count = bench_counts[seq];
+        uint64_t count = MSG_COUNTS[seq];
         struct timespec t0, t1;
         double elapsed;
 
