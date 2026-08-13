@@ -4,22 +4,19 @@
  *
  * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
  * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
- * ex1's converged counts table (BW_BENCH_COUNTS overrides it per size).
- * Per size, an untimed warmup round (BW_WARMUP_COUNTS, default 0) runs
- * before the timed benchmark round whose batch of RDMA WRITEs is clocked:
- * K WRs posted per ibv_post_send as a linked list (W=256, K=64, fixed —
- * no options besides the two temporary count overrides, see
- * docs/research/perf-experiments.md), only the K-th WR of the stream
- * signaled — one CQE per K WRs, so completions are accounted in exact
- * multiples of K (RC in-order)
+ * ex1's converged counts table. Per size the timed batch of RDMA WRITEs
+ * (no warmup — ex1's warmup counts measured no benefit, and their wire
+ * time sits inside the measured window): K WRs posted per ibv_post_send
+ * as a linked list (W=256, K=64, fixed — no options), only the K-th WR of
+ * the stream signaled — one CQE per K WRs, so completions are accounted
+ * in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
  * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
- * The clock (CLOCK_MONOTONIC) starts at the benchmark round's first post
- * and stops at its ack-receive completion (ADR-0003); each size prints an
- * ex1-identical "size\t%.2f\tunit" line with auto-scaled bps→Gbps units
- * for that round only — the warmup round is silent. The server's only
- * data-path role is absorbing the WRITEs into its registered buffer; it
- * just acks each done, two rounds per size to mirror the client.
+ * The clock (CLOCK_MONOTONIC) starts at the first timed post and stops at
+ * the ack-receive completion (ADR-0003); each size prints an ex1-identical
+ * "size\t%.2f\tunit" line with auto-scaled bps→Gbps units. The server's
+ * only data-path role is absorbing the WRITEs into its registered buffer;
+ * it just acks each done.
  *
  * The control protocol (T3): per size one done SEND (client, signaled)
  * and one ack SEND (server, 8-byte inline carrying the sequence counter),
@@ -63,19 +60,16 @@
  * so there is no buffer-reuse hazard at full window depth (ADR-0002). */
 #define BUFFER_SIZE (1u << 20)
 
-/* The number of control exchanges per direction: one done/ack pair per
- * size of the sweep (2^0..2^20). */
-#define SWEEP_SIZES 21
-
-/* Control receive pool (ADR-0001): posted once at init, all pointing at
- * one control area, never refreshed. Sized 2 * SWEEP_SIZES — a warmup
- * round and a benchmark round per size (BW_WARMUP_COUNTS/BW_BENCH_COUNTS,
- * bw_client_bench), each its own done/ack round trip, unconditionally
- * (a zero-count warmup round still trades done/ack, so both sides always
- * agree on exactly 2 rounds per size — no per-size skip, which would
- * desync the server since it never learns the client's counts). */
-#define CTRL_POOL_DEPTH (2 * SWEEP_SIZES)
+/* Control receive pool (ADR-0001): 32 receives per side, posted once at
+ * init, all pointing at one control area, never refreshed. Covers the 21
+ * per-direction control messages of a full sweep. */
+#define CTRL_POOL_DEPTH 32
 #define CTRL_MSG_LEN 64
+
+/* The number of control exchanges per direction: one done/ack pair per
+ * size of the sweep (2^0..2^20), which also proves the 32-deep control
+ * receive pool covers a full sweep. */
+#define SWEEP_SIZES 21
 
 /* The ex1 converged counts table, verbatim: one entry per size of the
  * sweep (2^0..2^20). MSG_COUNTS from ex1's convergence experiments
@@ -899,101 +893,21 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* One post -> done -> ack round trip of `count` WRITEs of `size` bytes, on
- * a freshly-reset pipeline (bw_data_state does not survive a round). The
- * done needs one free SQ slot: the refill exits with at most
- * sq_depth - K - 1 WRs outstanding and the final list adds at most K, so
- * at most sq_depth - 1 — the slot is always free. `t0`/`t1`, when
- * non-NULL, are stamped at the first post and the ack-receive completion
- * (ADR-0003) — the caller times only the round it cares about (a warmup
- * round passes NULL, NULL). */
-static int bw_run_round(struct bw_context *ctx, const struct bw_dest *dest,
-                        uint32_t seq, size_t size, uint64_t count,
-                        struct ibv_send_wr *wrs, struct ibv_sge *sges,
-                        struct timespec *t0, struct timespec *t1)
-{
-    struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
-    struct bw_data_state st = { 0, 0 };
-
-    if (t0)
-        clock_gettime(CLOCK_MONOTONIC, t0);
-
-    if (bw_post_writes(ctx, dest, size, count, wrs, sges, &st, 1))
-        return 1;
-
-    if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
-        return 1;
-
-    if (bw_recv_ctrl(ctx,
-                     (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),
-                     seq, "Ack", t1))
-        return 1;
-
-    return 0;
-}
-
-/* Parses a comma-separated list of exactly SWEEP_SIZES counts from the
- * env var `name` into `out`; leaves `out` untouched (the caller's default
- * stands) if `name` is unset. Temporary, for finding the per-size
- * warmup/benchmark counts experimentally — delete once the numbers are
- * baked into fixed tables (see docs/research/perf-experiments.md). */
-static int bw_parse_counts_env(const char *name, uint64_t *out)
-{
-    const char *val = getenv(name);
-    char *copy, *tok, *save;
-    int i = 0;
-
-    if (!val)
-        return 0;
-
-    copy = strdup(val);
-    if (!copy) {
-        fprintf(stderr, "%s: out of memory\n", name);
-        return 1;
-    }
-
-    for (tok = strtok_r(copy, ",", &save); tok;
-         tok = strtok_r(NULL, ",", &save)) {
-        if (i >= SWEEP_SIZES) {
-            fprintf(stderr, "%s: too many values, expected %d\n",
-                    name, SWEEP_SIZES);
-            free(copy);
-            return 1;
-        }
-        out[i++] = strtoull(tok, NULL, 0);
-    }
-    free(copy);
-
-    if (i != SWEEP_SIZES) {
-        fprintf(stderr, "%s: expected %d comma-separated values, got %d\n",
-                name, SWEEP_SIZES, i);
-        return 1;
-    }
-    return 0;
-}
-
-/* Client side of the full sweep: per size, an untimed warmup round
- * (BW_WARMUP_COUNTS[seq], default 0) immediately followed by the timed
- * benchmark round (BW_BENCH_COUNTS[seq], default MSG_COUNTS[seq]) whose
- * elapsed time (first post to ack-receive completion) is printed. Both
- * rounds always run, even at count 0 — a size can't skip its warmup round
- * only on the client, since the server never learns the counts and would
- * desync waiting for a done that never comes; the 42 acks (2 per size)
- * consume 42 of the pre-posted control receive pool, never refreshed. */
+/* Client side of the full sweep: per size, the clock starts at the first
+ * timed post and stops at the ack-receive completion (ADR-0003) — closed
+ * by the done SEND. The done needs one free SQ slot: the refill exits
+ * with at most sq_depth - K - 1 WRs outstanding and the final list adds
+ * at most K, so at most sq_depth - 1 — the slot is always free. The ack
+ * wait passes the data and done-send completions through; the 21 acks
+ * consume 21 of the 32 pre-posted control receive pool, never
+ * refreshed. */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
     struct ibv_send_wr *wrs;
     struct ibv_sge *sges;
-    uint64_t warmup_counts[SWEEP_SIZES] = { 0 };
-    uint64_t bench_counts[SWEEP_SIZES];
     uint32_t seq;
     int rc = 1;
-
-    memcpy(bench_counts, MSG_COUNTS, sizeof bench_counts);
-    if (bw_parse_counts_env("BW_WARMUP_COUNTS", warmup_counts) ||
-        bw_parse_counts_env("BW_BENCH_COUNTS", bench_counts))
-        return 1;
 
     wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
     sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
@@ -1004,15 +918,23 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
-        uint64_t count = bench_counts[seq];
+        uint64_t count = MSG_COUNTS[seq];
+        struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
         struct timespec t0, t1;
         double elapsed;
+        struct bw_data_state st = { 0, 0 };
 
-        if (bw_run_round(ctx, dest, seq, size, warmup_counts[seq],
-                         wrs, sges, NULL, NULL))
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        if (bw_post_writes(ctx, dest, size, count, wrs, sges, &st, 1))
             goto out;
 
-        if (bw_run_round(ctx, dest, seq, size, count, wrs, sges, &t0, &t1))
+        if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
+            goto out;
+
+        if (bw_recv_ctrl(ctx,
+                         (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),
+                         seq, "Ack", &t1))
             goto out;
 
         elapsed = (double) (t1.tv_sec - t0.tv_sec) +
@@ -1030,29 +952,23 @@ out:
 /* Server side: poll each done off the pre-posted control receive pool —
  * nothing is ever reposted — verify its sequence counter, and ack it back.
  * The ack's own send completion is consumed before the next done is
- * awaited: it is the guarantee the ack left the HCA. Two rounds per size
- * (a warmup round, then the benchmark round) to mirror bw_client_bench —
- * unconditionally, since the server never learns the client's per-size
- * counts and so cannot tell a skipped warmup round from a desync. */
+ * awaited: it is the guarantee the ack left the HCA. */
 static int bw_server_ctrl_exchange(struct bw_context *ctx)
 {
     uint32_t seq;
-    int round;
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
-        for (round = 0; round < 2; ++round) {
-            struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
-            struct ibv_wc wc;
+        struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
+        struct ibv_wc wc;
 
-            if (bw_recv_ctrl(ctx, 0, seq, "Done", NULL))
-                return 1;
+        if (bw_recv_ctrl(ctx, 0, seq, "Done", NULL))
+            return 1;
 
-            if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
-                return 1;
+        if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
+            return 1;
 
-            if (bw_poll_until(ctx, BW_SEND_ACK_WRID, 0, &wc))
-                return 1;
-        }
+        if (bw_poll_until(ctx, BW_SEND_ACK_WRID, 0, &wc))
+            return 1;
     }
 
     return 0;
