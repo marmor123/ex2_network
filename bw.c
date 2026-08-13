@@ -10,11 +10,10 @@
  * measurement, not applied uniformly, see
  * docs/research/perf-experiments.md) runs untimed before the timed
  * benchmark round whose batch of RDMA WRITEs is clocked: K WRs posted
- * per ibv_post_send as a linked list (W=256, K=64 by default,
- * overridable via BW_WINDOW/BW_SIGNAL_INTERVAL — temporary, for
- * re-testing W/K experimentally), only the K-th WR of the stream
- * signaled — one CQE per K WRs, so completions are accounted in exact
- * multiples of K (RC in-order)
+ * per ibv_post_send as a linked list (W=128, K=32, re-measured on this
+ * RDMA path — see docs/research/perf-experiments.md), only the K-th WR
+ * of the stream signaled — one CQE per K WRs, so completions are
+ * accounted in exact multiples of K (RC in-order)
  * — reclaimed only while the window is full (refill-never-empty, the SQ
  * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
  * The clock (CLOCK_MONOTONIC) starts at the benchmark round's first post
@@ -138,20 +137,23 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
 #define IB_PORT 1
 #define HANDSHAKE_PORT 18515
 
-/* Pipe depth W (window) and signal interval K default to the values this
- * repo already measured as invariant (ADR-0006), but are overridable via
- * BW_WINDOW/BW_SIGNAL_INTERVAL (main()) for re-testing that measurement —
- * temporary, for finding the optimal W/K experimentally, delete once
- * settled (see docs/research/perf-experiments.md). The SQ depth is
- * requested as W + K: the pipe depth plus one signal interval, exactly
- * the deepest the refill lets the SQ get: its single trigger
- * (outstanding + K ≥ sq_depth) holds the pipe at W outstanding when the
- * grant matches the request, and at sq_depth - K if the max_qp_wr clamp
- * cuts the grant short. K ≤ W keeps the pipe at least one full K-WR list
- * deep, so the refill never fires before a complete list is in flight —
- * checked at runtime now that both are runtime values (bw_init_ctx). */
-#define WINDOW_DEFAULT 256
-#define SIGNAL_INTERVAL_DEFAULT 64
+/* Pipe depth W (window) and signal interval K, re-measured on this RDMA
+ * path (ADR-0006 measured the old 256/64 invariant, but that predates
+ * this session's re-test, which found W=128/K=32 a small, reproducible
+ * edge over 256/64 — confound-controlled against a run-order/drift
+ * effect by re-running with the level order reversed; the win held
+ * either way. Full sweep and rationale: docs/research/perf-experiments.md.
+ * The SQ depth is requested as W + K: the pipe depth plus one signal
+ * interval, exactly the deepest the refill lets the SQ get: its single
+ * trigger (outstanding + K ≥ sq_depth) holds the pipe at W outstanding
+ * when the grant matches the request, and at sq_depth - K if the
+ * max_qp_wr clamp cuts the grant short. */
+#define WINDOW 128
+#define SIGNAL_INTERVAL 32
+
+/* K ≤ W keeps the pipe (W outstanding) at least one full K-WR list deep,
+ * so the refill never fires before a complete list is in flight. */
+typedef char bw_params_sane[SIGNAL_INTERVAL <= WINDOW ? 1 : -1];
 
 /* The largest max_inline_data tried at QP creation. mlx4 — the course
  * hardware — rejects QP creation when the declared value exceeds what its
@@ -201,7 +203,6 @@ struct bw_context {
     void			*ctrl_buf;/* the control receive area */
     uint32_t		 max_inline_data; /* the QP's negotiated max_inline_data */
     uint32_t		 sq_depth;      /* the QP's negotiated max_send_wr */
-    uint32_t		 signal_interval; /* K -- see BW_SIGNAL_INTERVAL, main() */
     struct ibv_port_attr	 portinfo;
 };
 
@@ -501,8 +502,7 @@ out:
 }
 
 static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
-                                      int is_server, uint32_t window,
-                                      uint32_t signal_interval)
+                                      int is_server)
 {
     struct bw_context *ctx;
     struct ibv_device_attr dev_attr;
@@ -512,8 +512,6 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
     ctx = calloc(1, sizeof *ctx);
     if (!ctx)
         return NULL;
-
-    ctx->signal_interval = signal_interval;
 
     ctx->buf = malloc(roundup(BUFFER_SIZE, page_size));
     if (!ctx->buf) {
@@ -540,7 +538,7 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
         fprintf(stderr, "Couldn't query device attributes\n");
         return NULL;
     }
-    max_send_wr = window + signal_interval;
+    max_send_wr = WINDOW + SIGNAL_INTERVAL;
     max_recv_wr = CTRL_POOL_DEPTH;
     if (max_send_wr > (uint32_t) dev_attr.max_qp_wr)
         max_send_wr = dev_attr.max_qp_wr;
@@ -833,7 +831,7 @@ struct bw_data_state {
  * still in flight, so the poll is retried. */
 static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 {
-    while (st->outstanding + ctx->signal_interval >= (uint64_t) ctx->sq_depth) {
+    while (st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
@@ -846,7 +844,7 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 
         if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
             return 1;
-        st->outstanding -= ctx->signal_interval;
+        st->outstanding -= SIGNAL_INTERVAL;
     }
     return 0;
 }
@@ -872,7 +870,7 @@ static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
         : 0;
 
     while (n > 0) {
-        uint64_t chunk = n < ctx->signal_interval ? n : ctx->signal_interval;
+        uint64_t chunk = n < SIGNAL_INTERVAL ? n : SIGNAL_INTERVAL;
         struct ibv_send_wr *bad_wr;
         uint64_t i;
 
@@ -882,7 +880,7 @@ static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
         for (i = 0; i < chunk; ++i) {
             uint64_t t = st->posted + i + 1; /* this WR's position in the stream */
             uint32_t signal =
-                    (t % ctx->signal_interval == 0) ||
+                    (t % SIGNAL_INTERVAL == 0) ||
                     (final && n == chunk && i == chunk - 1);
 
             sges[i] = (struct ibv_sge) {
@@ -979,8 +977,8 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
     uint32_t seq;
     int rc = 1;
 
-    wrs = calloc(ctx->signal_interval, sizeof *wrs);
-    sges = calloc(ctx->signal_interval, sizeof *sges);
+    wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
+    sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
     if (!wrs || !sges) {
         fprintf(stderr, "Couldn't allocate data batch\n");
         goto out;
@@ -1097,38 +1095,17 @@ int main(int argc, char *argv[])
     struct bw_dest          my_dest;
     struct bw_dest         *rem_dest;
     char                    *servername = NULL;
-    uint32_t                 window = WINDOW_DEFAULT;
-    uint32_t                 signal_interval = SIGNAL_INTERVAL_DEFAULT;
 
     srand48(getpid() * time(NULL));
 
     /* The only interface: no hostname starts a server, one hostname or IP
-     * connects to it. Everything else besides the handshake port and the
-     * device is fixed at compile time -- except W/K, temporarily
-     * overridable via BW_WINDOW/BW_SIGNAL_INTERVAL (see WINDOW_DEFAULT). */
+     * connects to it. Everything else — W, K, the handshake port, the
+     * device — is fixed at compile time. */
     if (argc == 2)
         servername = strdup(argv[1]);
     else if (argc > 2) {
         usage(argv[0]);
         return 1;
-    }
-
-    {
-        const char *w = getenv("BW_WINDOW");
-        const char *k = getenv("BW_SIGNAL_INTERVAL");
-
-        if (w)
-            window = strtoul(w, NULL, 0);
-        if (k)
-            signal_interval = strtoul(k, NULL, 0);
-        if (window < 1 || signal_interval < 1 ||
-            signal_interval > window) {
-            fprintf(stderr,
-                    "BW_WINDOW (%u) / BW_SIGNAL_INTERVAL (%u): need both "
-                    ">= 1 and BW_SIGNAL_INTERVAL <= BW_WINDOW\n",
-                    window, signal_interval);
-            return 1;
-        }
     }
 
     page_size = sysconf(_SC_PAGESIZE);
@@ -1146,7 +1123,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    ctx = bw_init_ctx(ib_dev, IB_PORT, !servername, window, signal_interval);
+    ctx = bw_init_ctx(ib_dev, IB_PORT, !servername);
     if (!ctx)
         return 1;
 

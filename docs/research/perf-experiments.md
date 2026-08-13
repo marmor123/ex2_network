@@ -219,3 +219,102 @@ sensitivity in the warmup sweep too (1024/2048/8192 got nonzero warmup;
 32 sits right at the message-rate-bound → inline-copy transition) — the
 regime-boundary sizes are noisier and need more samples to converge,
 consistent with `docs/research/small-size-ceiling.md`/`inline-copy.md`.
+
+## Window depth (W) / signal interval (K)
+
+**Hypothesis**: ADR-0006 measured W/K invariant (doubling either
+"nothing moves," within 0.07% at 1 B across (256,64)/(512,64)/(256,128)/
+(512,128)) — but that predates this session's warmup/CQE-batch/
+bench-count re-tests, so re-verifying rather than trusting the old
+result, per the standing instruction to test rather than assume.
+
+**Change**: `sweep_wk.sh`, 5 pairs (today's default 256:64, ADR-0006's
+other three combos, plus 128:32 — a smaller pipe not tried before), 10
+runs each, one SSH session. W/K are client-only (the server never posts
+data WRs or runs the refill loop), so no protocol change was needed on
+that side.
+
+**Measured, run 1** (`256:64 512:64 256:128 512:128 128:32` — order
+tested, avg Gbps):
+
+| size (B) | W256K64 | W512K64 | W256K128 | W512K128 | W128K32 |
+|---|---|---|---|---|---|
+| 1 | 0.04953 | 0.04953 | 0.04952 | 0.04953 | 0.04948 |
+| 2 | 0.09847 | 0.09850 | 0.09831 | 0.09802 | 0.09859 |
+| 4 | 0.19808 | 0.19812 | 0.19791 | 0.19806 | 0.19643 |
+| 8 | 0.39527 | 0.39517 | 0.39221 | 0.39489 | 0.39531 |
+| 16 | 0.79187 | 0.79182 | 0.79129 | 0.79142 | 0.79191 |
+| 32 | 1.57300 | 1.57300 | 1.57000 | 1.57000 | 1.57800 |
+| 64 | 2.63100 | 2.63100 | 2.63000 | 2.63000 | 2.64000 |
+| 128 | 3.59400 | 3.60000 | 3.59700 | 3.59500 | 3.60300 |
+| 256 | 5.81000 | 5.81000 | 5.80000 | 5.79800 | 5.81500 |
+| 512 | 6.26000 | 6.26000 | 6.25100 | 6.24900 | 6.26500 |
+| 1024 | 6.64100 | 6.64600 | 6.61000 | 6.60200 | 6.60200 |
+| 2048 | 33.52900 | 33.50700 | 33.67200 | 33.61800 | 33.70400 |
+| 4096 | 37.97600 | 37.97800 | 37.92100 | 37.90800 | 38.00400 |
+| 8192 | 37.87500 | 37.87800 | 37.66400 | 37.75900 | 37.89700 |
+| 16384 | 37.91500 | 37.90100 | 37.71400 | 37.79800 | 37.93000 |
+| 32768 | 38.10800 | 38.10600 | 38.04700 | 38.05000 | 38.13700 |
+| 65536 | 37.94600 | 37.93700 | 37.91300 | 37.91400 | 37.98300 |
+| 131072 | 37.97800 | 37.97600 | 37.98100 | 37.96700 | 38.00200 |
+| 262144 | 38.01500 | 38.02600 | 38.01400 | 38.01200 | 38.01800 |
+| 524288 | 38.15900 | 38.16200 | 38.15800 | 38.16000 | 38.16100 |
+| 1048576 | 38.17000 | 38.17400 | 38.17100 | 38.17200 | 38.17400 |
+
+W128K32 won 16/21 rows (next-best: W512K64 at 6/21). Since W128K32 ran
+**last** in this sequence, that pattern alone doesn't rule out session
+drift (the shared cluster quieting down, thermal settling, etc.)
+systematically favoring whichever level runs last — so this was
+re-tested with the order fully reversed before trusting it.
+
+**Measured, run 2** (`128:32 512:128 256:128 512:64 256:64` — order
+reversed, W128K32 now **first**, avg Gbps):
+
+| size (B) | W128K32 | W512K128 | W256K128 | W512K64 | W256K64 |
+|---|---|---|---|---|---|
+| 1 | 0.04954 | 0.04953 | 0.04952 | 0.04954 | 0.04949 |
+| 2 | 0.09862 | 0.09820 | 0.09831 | 0.09852 | 0.09851 |
+| 4 | 0.19813 | 0.19807 | 0.19787 | 0.19810 | 0.19811 |
+| 8 | 0.39545 | 0.39487 | 0.39486 | 0.39524 | 0.39522 |
+| 16 | 0.79201 | 0.79145 | 0.79143 | 0.79180 | 0.79174 |
+| 32 | 1.58000 | 1.57000 | 1.56700 | 1.57500 | 1.57300 |
+| 64 | 2.64000 | 2.63000 | 2.63000 | 2.63000 | 2.63000 |
+| 128 | 3.60600 | 3.59200 | 3.60000 | 3.60000 | 3.59800 |
+| 256 | 5.81700 | 5.80000 | 5.80000 | 5.81000 | 5.79700 |
+| 512 | 6.26700 | 6.25000 | 6.24900 | 6.26000 | 6.26300 |
+| 1024 | 6.61500 | 6.63600 | 6.60200 | 6.61000 | 6.60800 |
+| 2048 | 33.60700 | 33.52700 | 33.52400 | 33.62400 | 33.26700 |
+| 4096 | 37.99400 | 37.93100 | 37.91600 | 37.97800 | 37.97900 |
+| 8192 | 37.92100 | 37.76900 | 37.76100 | 37.88400 | 37.80600 |
+| 16384 | 37.95200 | 37.79500 | 37.81600 | 37.86900 | 37.90400 |
+| 32768 | 38.13000 | 38.04600 | 38.05400 | 38.11000 | 38.11100 |
+| 65536 | 37.98700 | 37.91100 | 37.91300 | 37.94000 | 37.93000 |
+| 131072 | 37.99100 | 37.97400 | 37.97500 | 37.97500 | 37.98100 |
+| 262144 | 38.01700 | 38.02100 | 38.01300 | 38.02000 | 38.01000 |
+| 524288 | 38.11300 | 38.16000 | 38.16300 | 38.15700 | 38.14700 |
+| 1048576 | 38.17100 | 38.17600 | 38.17100 | 38.17100 | 38.17300 |
+
+W128K32 still won 16/21 rows, and its aggregate normalized score
+(99.98) essentially matched run 1's (99.92) despite the position flip —
+if it were drift, the winner should have flipped to whichever ran last
+instead. The per-size edge of W128K32 over W256K64 also agrees in sign
+between the two runs at 16/21 sizes (the 5 disagreements are all
+small-magnitude, <0.6%, consistent with ordinary noise). This rules out
+the order confound.
+
+**Verdict: real, reproducible edge — baked in as the new default
+(`WINDOW`/`SIGNAL_INTERVAL` 256/64 → 128/32).** The edge itself is
+modest (mostly +0.05% to +0.3%, largest and most consistent at 2048 B:
++0.52% then +1.02%) and not universally positive (size 4 and 1024 each
+showed one negative outlier across the two runs) — but the aggregate
+win-rate and its stability under order-reversal are well beyond what
+chance alone would produce across two independent 10-run-per-level
+sweeps. Plausible mechanism: a smaller K (32 vs 64) makes the refill
+loop reclaim SQ slots more often, keeping the pipe tighter and more
+responsive — consistent with the CQE-batch-drain experiment's finding
+that in steady state a single CQE reclaim already satisfies the refill's
+depth trigger almost every call, so a smaller, more frequent trigger has
+more chances to keep the SQ topped up without over-committing.
+
+Env-var override (`BW_WINDOW`/`BW_SIGNAL_INTERVAL`) is gone — W/K are
+fixed constants again, now at 128/32 instead of 256/64.
