@@ -114,12 +114,6 @@ typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
 #define IB_PORT 1
 #define HANDSHAKE_PORT 18515
 
-/* The refill's poll never requests more CQEs than could possibly be
- * outstanding at once: sq_depth / K, since each signaled CQE accounts for
- * exactly K WRs. Sized off the nominal (unclamped) sq_depth — a tight
- * upper bound, not a magic margin. */
-#define REFILL_BATCH ((WINDOW + SIGNAL_INTERVAL) / SIGNAL_INTERVAL)
-
 /* K ≤ W keeps the pipe (W outstanding) at least one full K-WR list deep,
  * so the refill never fires before a complete list is in flight. The
  * option-era runtime guard is gone; the fixed constants make the check
@@ -790,15 +784,10 @@ struct bw_data_state {
  * reclaim only the CQEs that are ready — each data CQE accounts for
  * exactly K WRs, because only the K-th WR of the stream is signaled and
  * RC completions are in-order — then return immediately so the caller
- * reposts; the SQ never empties and the NIC never idles. The poll never
- * waits for more than are already sitting in the CQ (ibv_poll_cq itself
- * never blocks): it requests up to REFILL_BATCH at once so it drains
- * every CQE already ready in a single call instead of one per call, but
- * a lone ready CQE is taken and acted on immediately, same as before.
- * The single trigger is the SQ depth itself: with the SQ sized W + K
- * (bw_init_ctx), waiting while outstanding + K ≥ sq_depth holds the pipe
- * at W outstanding, and at sq_depth - K if the max_qp_wr clamp granted
- * less.
+ * reposts; the SQ never empties and the NIC never idles. The single
+ * trigger is the SQ depth itself: with the SQ sized W + K (bw_init_ctx),
+ * waiting while outstanding + K ≥ sq_depth holds the pipe at W
+ * outstanding, and at sq_depth - K if the max_qp_wr clamp granted less.
  * The final list's CQE is never reclaimed here: no list is posted after
  * it, so the refill cannot run again; that CQE stays in the CQ for the
  * ack wait to consume (it precedes the ack, ADR-0003). During the data
@@ -808,9 +797,8 @@ struct bw_data_state {
 static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 {
     while (st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
-        struct ibv_wc wc[REFILL_BATCH];
-        int ne = ibv_poll_cq(ctx->cq, REFILL_BATCH, wc);
-        int i;
+        struct ibv_wc wc;
+        int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
         if (ne < 0) {
             fprintf(stderr, "poll CQ failed %d\n", ne);
@@ -819,11 +807,9 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
         if (ne == 0)
             continue;
 
-        for (i = 0; i < ne; i++) {
-            if (bw_wc_bad(&wc[i], 1ull << BW_DATA_WRID))
-                return 1;
-            st->outstanding -= SIGNAL_INTERVAL;
-        }
+        if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
+            return 1;
+        st->outstanding -= SIGNAL_INTERVAL;
     }
     return 0;
 }
