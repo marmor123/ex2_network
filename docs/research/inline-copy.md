@@ -1,5 +1,12 @@
 # Research: what performs the ~853 MB/s per-message copy at ≤ 1 KB?
 
+**Caveat (added later, not corrected in place):** this doc's mechanistic
+argument is built on `libmlx4`/`mlx4_ib` source. `ibv_devinfo -v` on both
+course nodes reports `mlx5_0` (Connect-IB, not ConnectX-3) — see
+`docs/research/gid-and-hca-family.md`. The measured throughput numbers
+below are still real; the driver-source-level explanation of *why* may
+not describe the hardware actually in use.
+
 Wayfinder ticket #12 — resolution record. Question: ADR-0004/0005 attribute the ≤ 1 KB
 throughput plateau (per-message cost `L(size) = size / 853 MB/s + 0.05 µs`, capping
 ≤ 1 KB at ~6.4 Gbps on the dev pair, 5.84/6.29/6.55 Gbps at 256 B/512 B/1 KB on

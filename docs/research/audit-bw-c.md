@@ -4,6 +4,8 @@ Wayfinder ticket #10. Primary sources read in full: `CONTEXT.md` (glossary), `as
 
 **Headline verdict: no correctness bugs found. bw.c satisfies the assignment and all seven ADR decisions. Nine of nine audited components are correct; one documentation comment is inaccurate; four optimizable/hardening items are listed (none blocks submission).**
 
+**Caveat (added later, not corrected in place):** two findings below ("mlx4 ignores lkey on the inline path"; "on mlx4 the [CQ] size rounds up") assume the mlx4 driver. `ibv_devinfo -v` on both course nodes reports `mlx5_0` (Connect-IB) — see `docs/research/gid-and-hca-family.md`. Doesn't change the headline verdict (both are `mlx4`-only rationale for why something is *already safe*, not something the code depends on), but the specific driver claims are unverified for mlx5.
+
 ## Per-component verdict table
 
 | # | Component | Verdict | Evidence |

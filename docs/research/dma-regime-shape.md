@@ -1,5 +1,12 @@
 # The DMA regime's shape: 2 KB ramp, 1 MB dip, pair gap (issue #13)
 
+**Caveat (added later, not corrected in place):** this doc attributes
+the 2 KB ramp to "the mlx4 DMA path" and cites "ConnectX-3 / FDR
+specifications." `ibv_devinfo -v` on both course nodes reports `mlx5_0`
+(Connect-IB), not mlx4/ConnectX-3 — see
+`docs/research/gid-and-hca-family.md`. The measured numbers/shapes below
+are still real; the driver/hardware-family attribution is not.
+
 Research ticket #13. Three unexplained shapes in the measured envelope (ADR-0006/0007):
 the 2 KB ramp point, the 1 MB dip, and the 38 vs 42.5 Gbps pair gap. All facts below
 are traced to the primary sources: `bw.c` (the counts table, the window, the timed/

@@ -1,5 +1,19 @@
 # What caps the ~6.1M msg/s small-message regime (1–32 B)?
 
+**Caveat (added later, not corrected in place):** two things below don't
+hold up. (1) The mechanistic argument cites `rdma-core`'s **mlx4**
+provider and states the HCA family as "ConnectX-3, `mlx4`" — but
+`ibv_devinfo -v` on both course nodes reports `mlx5_0` (Connect-IB); see
+`docs/research/gid-and-hca-family.md`. (2) The "invariant to the window
+and the signal interval" claim in the verdict below (based on the old
+K=64 default) is contradicted by this session's own W/K re-test
+(`docs/research/perf-experiments.md`): W=128/K=32 shows a small,
+confound-controlled, reproducible throughput edge over W=256/K=64 —
+re-run twice with the test order reversed to rule out session drift, and
+the win held both times. W/K are not actually invariant. The measured
+message-rate numbers below are still real; the "why" and the
+invariance claim are not reliable as stated.
+
 Research ticket [#11](https://github.com/marmor123/ex2_network/issues/11) — the T4 attribution of the message-rate ceiling to "one WQE + one doorbell per `ibv_post_send`" (ADR-0004) is stale for the K=64 streaming path: the doorbell is now one per 64 WRs. This note finds what per-message work actually remains in the post loop and the completion path, and what the measured numbers imply.
 
 **Verdict in one line**: post-batching, the ceiling is a flat ~163 ns per message (6.1M msg/s) that is invariant to the window and the signal interval and independent of payload up to 32 B — a per-message (per-WQE) rate limit, machine-constant on each course pair, with exactly two surviving candidates: the client's per-WQE post-loop work on the old stack, or the HCA's per-QP WQE-processing rate (observed through the completion path, because the refill slaves the post rate to CQE availability). The repo data rules out every per-list and per-completion cost; only a user-mediated experiment (checklist at the end) separates the two survivors.

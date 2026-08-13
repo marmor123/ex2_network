@@ -2,6 +2,6 @@
 
 Both control messages per size — the client's **done** and the server's **ack** — are `IBV_WR_SEND` work requests on the data QP, not TCP bytes. The assignment mandates the ack as a SEND; we made the done a SEND too because the ack must be a true completion barrier: RC in-order delivery means the server's done-receive completion proves every prior WRITE has landed in server memory, and the ack carries that guarantee back. A done sent over the TCP socket would not be ordered against the WRITEs, so the ack could arrive while the last WRITEs are still on the wire — the client's clock would stop early and throughput would be overstated.
 
-TCP is used only for the one-time handshake (LID/QPN/PSN/GID + server buffer addr/rkey), which happens before any data flows.
+TCP is used only for the one-time handshake (LID/QPN/PSN + server buffer addr/rkey), which happens before any data flows. GID/GRH was in the assignment template's handshake but is dropped here — this is single-subnet native InfiniBand (verified via `ibv_devinfo -v` on both course nodes: same `sm_lid`, `link_layer: InfiniBand`), so LID alone addresses the QP; see `docs/research/gid-and-hca-family.md`.
 
-Consequence: each side must always have a receive posted before the other can send. We post the entire **control receive pool** (32 receives per side, covering the 21 per-direction control messages) once at init — never refreshed — so the RQ can never be found empty.
+Consequence: each side must always have a receive posted before the other can send. We post the entire **control receive pool** once at init — never refreshed — so the RQ can never be found empty. Sized `2 * SWEEP_SIZES` (42) since the warmup round doubled the per-size done/ack round trips (`docs/research/perf-experiments.md`).
