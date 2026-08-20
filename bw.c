@@ -94,8 +94,8 @@ static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         163840, 10240, 81920, 20480, 40960,     /* 1B 2B 4B 8B 16B */
         10240, 10240, 10240, 5120, 2560,        /* 32B 64B 128B 256B 512B */
         5120, 10240, 2560, 640, 320,            /* 1KB 2KB 4KB 8KB 16KB */
-        320, 80, 40, 20, 20,                    /* 32KB 64KB 128KB 256KB 512KB */
-        10                                       /* 1MB */
+        320, 96, 64, 32, 32,                    /* 32KB 64KB 128KB 256KB 512KB */
+        32                                       /* 1MB */
 };
 
 /* Per-size warmup count: an untimed round of this many WRITEs immediately
@@ -849,65 +849,54 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
     return 0;
 }
 
-/* Post `n` RDMA WRITEs of `size` bytes into the server's registered
- * buffer, as a stream of K-WR linked lists, one per ibv_post_send (the
- * last list takes the remainder). Signal schedule: the K-th WR of the
- * size's stream (t % K == 0) and the stream's final WR — mid-stream
- * lists therefore yield one CQE per K WRs, while the final remainder is
- * accounted exactly by the signaled final WR (in-order RC). Messages ≤
- * max_inline_data ride the WQE inline (IBV_SEND_INLINE); larger ones use
- * the registered buffer. `wrs`/`sges` are the caller's K-deep WR arrays,
- * reused for every list. `final` marks the call that posts the stream's
- * last list (the timed one). */
-static int bw_post_writes(struct bw_context *ctx, const struct bw_dest *dest,
-                          size_t size, uint64_t n, struct ibv_send_wr *wrs,
-                          struct ibv_sge *sges, struct bw_data_state *st,
-                          int final)
+static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
+                             size_t size, struct ibv_send_wr *wrs,
+                             struct ibv_sge *sges)
 {
     uint32_t inline_flag =
-    (size <= 64 && size <= ctx->max_inline_data)
-        ? IBV_SEND_INLINE
-        : 0;
+        (size <= 64 && size <= ctx->max_inline_data)
+            ? IBV_SEND_INLINE
+            : 0;
+    uint64_t i;
 
+    for (i = 0; i < SIGNAL_INTERVAL; ++i) {
+        sges[i] = (struct ibv_sge) {
+            .addr   = (uint64_t) ctx->buf,
+            .length = size,
+            .lkey   = ctx->mr->lkey
+        };
+        wrs[i] = (struct ibv_send_wr) {
+            .wr_id      = BW_DATA_WRID,
+            .opcode     = IBV_WR_RDMA_WRITE,
+            .send_flags = inline_flag |
+                          (i == SIGNAL_INTERVAL - 1 ? IBV_SEND_SIGNALED : 0),
+            .sg_list    = &sges[i],
+            .num_sge    = 1,
+            .next       = (i + 1 < SIGNAL_INTERVAL) ? &wrs[i + 1] : NULL
+        };
+        wrs[i].wr.rdma.remote_addr = dest->buf_addr;
+        wrs[i].wr.rdma.rkey = dest->rkey;
+    }
+}
+
+/* Post `n` RDMA WRITEs into the server's registered buffer using the pre-built
+ * K-WR linked list `wrs`. */
+static int bw_post_writes(struct bw_context *ctx, uint64_t n,
+                          struct ibv_send_wr *wrs, struct bw_data_state *st)
+{
     while (n > 0) {
-        uint64_t chunk = n < SIGNAL_INTERVAL ? n : SIGNAL_INTERVAL;
         struct ibv_send_wr *bad_wr;
-        uint64_t i;
 
         if (bw_refill(ctx, st))
             return 1;
 
-        for (i = 0; i < chunk; ++i) {
-            uint64_t t = st->posted + i + 1; /* this WR's position in the stream */
-            uint32_t signal =
-                    (t % SIGNAL_INTERVAL == 0) ||
-                    (final && n == chunk && i == chunk - 1);
-
-            sges[i] = (struct ibv_sge) {
-                    .addr	= (uint64_t) ctx->buf,
-                    .length = size,
-                    .lkey	= ctx->mr->lkey
-            };
-            wrs[i] = (struct ibv_send_wr) {
-                    .wr_id	    = BW_DATA_WRID,
-                    .opcode	    = IBV_WR_RDMA_WRITE,
-                    .send_flags = inline_flag |
-                                  (signal ? IBV_SEND_SIGNALED : 0),
-                    .sg_list    = &sges[i],
-                    .num_sge    = 1,
-                    .next	    = i + 1 < chunk ? &wrs[i + 1] : NULL
-            };
-            wrs[i].wr.rdma.remote_addr = dest->buf_addr;
-            wrs[i].wr.rdma.rkey = dest->rkey;
-        }
-
-        if (ibv_post_send(ctx->qp, &wrs[0], &bad_wr)) {
+        if (ibv_post_send(ctx->qp, wrs, &bad_wr)) {
             fprintf(stderr, "Couldn't post data WRITEs\n");
             return 1;
         }
-        st->posted += chunk;
-        st->outstanding += chunk;
-        n -= chunk;
+        st->posted += SIGNAL_INTERVAL;
+        st->outstanding += SIGNAL_INTERVAL;
+        n -= SIGNAL_INTERVAL;
     }
     return 0;
 }
@@ -929,16 +918,9 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
 }
 
 /* One post -> done -> ack round trip of `count` WRITEs of `size` bytes, on
- * a freshly-reset pipeline (bw_data_state does not survive a round). The
- * done needs one free SQ slot: the refill exits with at most
- * sq_depth - K - 1 WRs outstanding and the final list adds at most K, so
- * at most sq_depth - 1 — the slot is always free. `t0`/`t1`, when
- * non-NULL, are stamped at the first post and the ack-receive completion
- * (ADR-0003) — the caller times only the round it cares about (the
- * warmup round passes NULL, NULL). */
-static int bw_run_round(struct bw_context *ctx, const struct bw_dest *dest,
-                        uint32_t seq, size_t size, uint64_t count,
-                        struct ibv_send_wr *wrs, struct ibv_sge *sges,
+ * a freshly-reset pipeline (bw_data_state does not survive a round). */
+static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
+                        struct ibv_send_wr *wrs,
                         struct timespec *t0, struct timespec *t1)
 {
     struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
@@ -947,7 +929,7 @@ static int bw_run_round(struct bw_context *ctx, const struct bw_dest *dest,
     if (t0)
         clock_gettime(CLOCK_MONOTONIC, t0);
 
-    if (bw_post_writes(ctx, dest, size, count, wrs, sges, &st, 1))
+    if (bw_post_writes(ctx, count, wrs, &st))
         return 1;
 
     if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
@@ -964,11 +946,7 @@ static int bw_run_round(struct bw_context *ctx, const struct bw_dest *dest,
 /* Client side of the full sweep: per size, the warmup round
  * (WARMUP_COUNTS, possibly 0) runs untimed, immediately followed by the
  * timed benchmark round (MSG_COUNTS) whose clock starts at the first post
- * and stops at the ack-receive completion (ADR-0003). Both rounds always
- * run, even at warmup count 0 — a size can't skip its warmup round only
- * on the client, since the server never learns the counts and would
- * desync waiting for a done that never comes; the 42 acks (2 per size)
- * consume 42 of the pre-posted control receive pool, never refreshed. */
+ * and stops at the ack-receive completion (ADR-0003). */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
     /* The K-deep WR arrays, reused for every linked list of the sweep. */
@@ -990,11 +968,13 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
         struct timespec t0, t1;
         double elapsed;
 
-        if (bw_run_round(ctx, dest, seq, size, WARMUP_COUNTS[seq],
-                         wrs, sges, NULL, NULL))
+        bw_build_wr_list(ctx, dest, size, wrs, sges);
+
+        if (bw_run_round(ctx, seq, WARMUP_COUNTS[seq],
+                         wrs, NULL, NULL))
             goto out;
 
-        if (bw_run_round(ctx, dest, seq, size, count, wrs, sges, &t0, &t1))
+        if (bw_run_round(ctx, seq, count, wrs, &t0, &t1))
             goto out;
 
         elapsed = (double) (t1.tv_sec - t0.tv_sec) +
