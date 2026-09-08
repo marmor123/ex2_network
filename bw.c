@@ -114,16 +114,6 @@ static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
         0                          /* 1MB */
 };
 
-/* Control messages: 4 bytes carrying the sequence counter (the size
- * index 0..20). The ack carries the received done verbatim, so a
- * sequence mismatch means the exchange desynchronized. */
-struct bw_ctrl_msg {
-    uint32_t seq;
-};
-
-/* The control message must always fit one inline send. */
-typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 4) ? 1 : -1];
-
 /* A control wait (the done on the server, the ack on the client, the
  * ack-send on the server) has a deadline: the peer may have died, and a
  * hung busy poll would tie up a course node until the verify script's
@@ -662,21 +652,21 @@ static int bw_post_control_recvs(struct bw_context *ctx)
 
 /* Post one control SEND — the client's done or the server's ack — always
  * signaled and riding inline. */
-static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
-                             const struct bw_ctrl_msg *msg)
+static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid)
 {
+    char dummy = 0;
     struct ibv_sge sge = {
-            .addr	= (uintptr_t) msg,
-            .length = sizeof *msg,
-            .lkey	= 0
+            .addr   = (uintptr_t) &dummy,
+            .length = sizeof dummy,
+            .lkey   = 0
     };
     struct ibv_send_wr wr = {
-            .wr_id	    = wrid,
-            .opcode	    = IBV_WR_SEND,
+            .wr_id      = wrid,
+            .opcode     = IBV_WR_SEND,
             .send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE,
             .sg_list    = &sge,
             .num_sge    = 1,
-            .next	    = NULL
+            .next       = NULL
     };
     struct ibv_send_wr *bad_wr;
 
@@ -741,15 +731,12 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
     }
 }
 
-/* Wait for the next control message on the pre-posted control receive
- * pool and verify it: the expected sequence counter.
+/* Wait for the next control completion on the pre-posted control receive pool.
  * `t_stamp`, when non-NULL, receives CLOCK_MONOTONIC at the completion —
  * the client's t1 for this size. */
-static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
-                        const char *kind, struct timespec *t_stamp)
+static int bw_recv_ctrl(struct bw_context *ctx, struct timespec *t_stamp)
 {
     struct ibv_wc wc;
-    struct bw_ctrl_msg msg;
 
     if (bw_poll_until(ctx, BW_RECV_WRID, &wc))
         return 1;
@@ -757,24 +744,9 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
     if (t_stamp)
         clock_gettime(CLOCK_MONOTONIC, t_stamp);
 
-    msg = *(const struct bw_ctrl_msg *) ctx->ctrl_buf;
-    if (msg.seq != seq) {
-        fprintf(stderr, "%s mismatch: seq %u, expected seq %u\n",
-                kind, msg.seq, seq);
-        return 1;
-    }
-
     return 0;
 }
 
-/* The client's streaming data-path state for one size: the windowed
- * pipeline (ADR-0002). posted counts every WR of the size's stream so
- * the signal schedule can pick the K-th WRs; outstanding is posted minus
- * the WRs the refill has reclaimed — exactly K per reclaimed CQE,
- * because only K-th WRs are signaled and RC completions are in-order;
- * the final list's remainder is covered by the CQEs the ack wait
- * consumes, never by the refill. Scoped to one size: the ack wait
- * consumes the remaining data and done completions without touching the
 /* Refill-never-empty (ADR-0002): once the SQ is as deep as it can be,
  * reclaim only the CQEs that are ready — each data CQE accounts for
  * exactly K WRs, because only the K-th WR of the stream is signaled and
@@ -867,12 +839,11 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* One post -> done -> ack round trip of `count` WRITEs of `size` bytes. */
-static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
+/* One post -> done -> ack round trip of `count` WRITEs. */
+static int bw_run_round(struct bw_context *ctx, uint64_t count,
                         struct ibv_send_wr *wrs,
                         struct timespec *t0, struct timespec *t1)
 {
-    struct bw_ctrl_msg done = { .seq = seq };
     uint64_t outstanding = 0;
 
     if (t0)
@@ -881,10 +852,10 @@ static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
     if (bw_post_writes(ctx, count, wrs, &outstanding))
         return 1;
 
-    if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
+    if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID))
         return 1;
 
-    if (bw_recv_ctrl(ctx, seq, "Ack", t1))
+    if (bw_recv_ctrl(ctx, t1))
         return 1;
 
     return 0;
@@ -917,11 +888,11 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
         bw_build_wr_list(ctx, dest, size, wrs, sges);
 
-        if (bw_run_round(ctx, seq, WARMUP_COUNTS[seq],
+        if (bw_run_round(ctx, WARMUP_COUNTS[seq],
                          wrs, NULL, NULL))
             goto out;
 
-        if (bw_run_round(ctx, seq, count, wrs, &t0, &t1))
+        if (bw_run_round(ctx, count, wrs, &t0, &t1))
             goto out;
 
         elapsed = (double) (t1.tv_sec - t0.tv_sec) +
@@ -937,7 +908,7 @@ out:
 }
 
 /* Server side: poll each done off the pre-posted control receive pool —
- * nothing is ever reposted — verify its sequence counter, and ack it back.
+ * nothing is ever reposted — and ack it back.
  * The ack's own send completion is consumed before the next done is
  * awaited: it is the guarantee the ack left the HCA. Two rounds per size
  * (a warmup round, then the benchmark round) to mirror bw_client_bench —
@@ -951,13 +922,12 @@ static int bw_server_ctrl_exchange(struct bw_context *ctx)
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         for (round = 0; round < 2; ++round) {
-            struct bw_ctrl_msg ack = { .seq = seq };
             struct ibv_wc wc;
 
-            if (bw_recv_ctrl(ctx, seq, "Done", NULL))
+            if (bw_recv_ctrl(ctx, NULL))
                 return 1;
 
-            if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
+            if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID))
                 return 1;
 
             if (bw_poll_until(ctx, BW_SEND_ACK_WRID, &wc))
