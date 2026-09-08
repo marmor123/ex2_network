@@ -711,10 +711,9 @@ static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
     return 0;
 }
 
-/* Classify one completion: good status and a wr_id whose bit is set in
- * `allowed`. Prints the error and returns 1 otherwise — the two poll
- * loops share this so their protocol-error reports cannot drift. */
-static int bw_wc_bad(struct ibv_wc *wc, uint64_t allowed)
+/* Classify one completion: checks for good status.
+ * Prints the error and returns 1 otherwise. */
+static int bw_wc_bad(struct ibv_wc *wc)
 {
     if (wc->status != IBV_WC_SUCCESS) {
         fprintf(stderr, "Bad status %s (%d) for wr_id %llu\n",
@@ -722,22 +721,13 @@ static int bw_wc_bad(struct ibv_wc *wc, uint64_t allowed)
                 (unsigned long long) wc->wr_id);
         return 1;
     }
-    if (!(allowed & (1ull << wc->wr_id))) {
-        fprintf(stderr, "Unexpected completion for wr_id %llu\n",
-                (unsigned long long) wc->wr_id);
-        return 1;
-    }
     return 0;
 }
 
 /* Poll the shared CQ until a completion with wr_id `want` arrives.
- * Completions whose wr_id bit is set in `pass` are consumed and ignored —
- * the client passes its done-send and data completions through while
- * waiting for the ack receive. Nothing else may complete, so a bad status
- * or an unexpected wr_id is a protocol error, as is a wait past the
- * deadline. */
+ * A bad status or a wait past the deadline is an error. */
 static int bw_poll_until(struct bw_context *ctx, uint64_t want,
-                         uint64_t pass, struct ibv_wc *wc)
+                         struct ibv_wc *wc)
 {
     struct timespec deadline;
 
@@ -753,7 +743,7 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
             return 1;
         }
         if (ne == 1) {
-            if (bw_wc_bad(wc, pass | (1ull << want)))
+            if (bw_wc_bad(wc))
                 return 1;
             if (wc->wr_id == want)
                 return 0;
@@ -774,18 +764,15 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
 
 /* Wait for the next control message on the pre-posted control receive
  * pool and verify it: the fixed tag and the expected sequence counter.
- * `pass` is handed to bw_poll_until — the client passes its done-send
- * and data completions through while waiting for the ack. `t_stamp`, when
- * non-NULL, receives CLOCK_MONOTONIC at the completion — the client's t1
- * for this size. */
-static int bw_recv_ctrl(struct bw_context *ctx, uint64_t pass,
-                        uint32_t seq, const char *kind,
-                        struct timespec *t_stamp)
+ * `t_stamp`, when non-NULL, receives CLOCK_MONOTONIC at the completion —
+ * the client's t1 for this size. */
+static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
+                        const char *kind, struct timespec *t_stamp)
 {
     struct ibv_wc wc;
     struct bw_ctrl_msg msg;
 
-    if (bw_poll_until(ctx, BW_RECV_WRID, pass, &wc))
+    if (bw_poll_until(ctx, BW_RECV_WRID, &wc))
         return 1;
 
     if (t_stamp)
@@ -842,7 +829,7 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
         if (ne == 0)
             continue;
 
-        if (bw_wc_bad(&wc, 1ull << BW_DATA_WRID))
+        if (bw_wc_bad(&wc))
             return 1;
         st->outstanding -= SIGNAL_INTERVAL;
     }
@@ -935,9 +922,7 @@ static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
     if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
         return 1;
 
-    if (bw_recv_ctrl(ctx,
-                     (1ull << BW_SEND_DONE_WRID) | (1ull << BW_DATA_WRID),
-                     seq, "Ack", t1))
+    if (bw_recv_ctrl(ctx, seq, "Ack", t1))
         return 1;
 
     return 0;
@@ -1007,13 +992,13 @@ static int bw_server_ctrl_exchange(struct bw_context *ctx)
             struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
             struct ibv_wc wc;
 
-            if (bw_recv_ctrl(ctx, 0, seq, "Done", NULL))
+            if (bw_recv_ctrl(ctx, seq, "Done", NULL))
                 return 1;
 
             if (bw_post_ctrl_send(ctx, BW_SEND_ACK_WRID, &ack))
                 return 1;
 
-            if (bw_poll_until(ctx, BW_SEND_ACK_WRID, 0, &wc))
+            if (bw_poll_until(ctx, BW_SEND_ACK_WRID, &wc))
                 return 1;
         }
     }
@@ -1060,13 +1045,6 @@ static int bw_close_ctx(struct bw_context *ctx)
     return 0;
 }
 
-static void usage(const char *argv0)
-{
-    printf("Usage:\n");
-    printf("  %s            start a server and wait for connection\n", argv0);
-    printf("  %s <host>     connect to server at <host>\n", argv0);
-}
-
 int main(int argc, char *argv[])
 {
     struct ibv_device      **dev_list;
@@ -1084,7 +1062,6 @@ int main(int argc, char *argv[])
     if (argc == 2)
         servername = strdup(argv[1]);
     else if (argc > 2) {
-        usage(argv[0]);
         return 1;
     }
 
