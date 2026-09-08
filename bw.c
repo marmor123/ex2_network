@@ -242,31 +242,22 @@ static int bw_write_full(int fd, const void *buf, size_t len)
     return 1;
 }
 
-static struct bw_dest *bw_parse_dest(const char *msg, int expect_addr)
+static int bw_parse_dest(const char *msg, int expect_addr, struct bw_dest *dest)
 {
-    struct bw_dest *dest = calloc(1, sizeof *dest);
     int n;
 
-    if (!dest)
-        return NULL;
-
-    /* The server's message carries all five fields; the client's carries the
-     * first three (addr/rkey stay zero). The client expects the server's
-     * addr/rkey — its RDMA WRITEs land there — so it requires all five; a
-     * truncated server message must not pass with addr/rkey zero. */
+    memset(dest, 0, sizeof *dest);
     n = sscanf(msg, DEST_FMT_PARSE,
                &dest->lid, &dest->qpn, &dest->psn,
                &dest->buf_addr, &dest->rkey);
-    if (n < 3 || (expect_addr && n < 5)) {
-        free(dest);
-        return NULL;
-    }
+    if (n < 3 || (expect_addr && n < 5))
+        return 1;
 
-    return dest;
+    return 0;
 }
 
 static int bw_connect_qp(struct bw_context *ctx, int port, int my_psn,
-                         struct bw_dest *dest)
+                         const struct bw_dest *dest)
 {
     struct ibv_qp_attr attr = {
             .qp_state		= IBV_QPS_RTR,
@@ -316,8 +307,9 @@ static int bw_connect_qp(struct bw_context *ctx, int port, int my_psn,
     return 0;
 }
 
-static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
-                                           const struct bw_dest *my_dest)
+static int bw_exch_dest_client(const char *servername, int port,
+                               const struct bw_dest *my_dest,
+                               struct bw_dest *rem_dest)
 {
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -328,17 +320,16 @@ static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
     char msg[DEST_MSG_LEN];
     int n;
     int sockfd = -1;
-    struct bw_dest *rem_dest = NULL;
 
     if (asprintf(&service, "%d", port) < 0)
-        return NULL;
+        return 1;
 
     n = getaddrinfo(servername, service, &hints, &res);
 
     if (n < 0) {
         fprintf(stderr, "%s for %s:%d\n", gai_strerror(n), servername, port);
         free(service);
-        return NULL;
+        return 1;
     }
 
     for (t = res; t; t = t->ai_next) {
@@ -357,43 +348,45 @@ static struct bw_dest *bw_exch_dest_client(const char *servername, int port,
     if (sockfd < 0) {
         /* No server listening: fail silently — exit non-zero with nothing
            printed (T1 acceptance criterion). */
-        return NULL;
+        return 1;
     }
 
     memset(msg, 0, sizeof msg);
     sprintf(msg, DEST_FMT, my_dest->lid, my_dest->qpn, my_dest->psn);
     if (!bw_write_full(sockfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
-        goto out;
+        close(sockfd);
+        return 1;
     }
 
     if (!bw_read_full(sockfd, msg, sizeof msg)) {
         perror("client read");
         fprintf(stderr, "Couldn't read remote address\n");
-        goto out;
+        close(sockfd);
+        return 1;
     }
 
     /* The server keeps the socket open until we signal receipt, so this
      * must go out before we close. */
     if (!bw_write_full(sockfd, "ready", sizeof "ready")) {
         perror("client write");
-        goto out;
+        close(sockfd);
+        return 1;
     }
 
-    rem_dest = bw_parse_dest(msg, 1);
-    if (!rem_dest) {
+    if (bw_parse_dest(msg, 1, rem_dest)) {
         fprintf(stderr, "Couldn't parse remote address\n");
-        goto out;
+        close(sockfd);
+        return 1;
     }
 
-out:
     close(sockfd);
-    return rem_dest;
+    return 0;
 }
 
-static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
-                                           int ib_port, int port,
-                                           const struct bw_dest *my_dest)
+static int bw_exch_dest_server(struct bw_context *ctx,
+                               int ib_port, int port,
+                               const struct bw_dest *my_dest)
 {
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -405,17 +398,17 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
     char msg[DEST_MSG_LEN];
     int n;
     int sockfd = -1, connfd;
-    struct bw_dest *rem_dest = NULL;
+    struct bw_dest rem_dest;
 
     if (asprintf(&service, "%d", port) < 0)
-        return NULL;
+        return 1;
 
     n = getaddrinfo(NULL, service, &hints, &res);
 
     if (n < 0) {
         fprintf(stderr, "%s for port %d\n", gai_strerror(n), port);
         free(service);
-        return NULL;
+        return 1;
     }
 
     for (t = res; t; t = t->ai_next) {
@@ -437,7 +430,7 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
 
     if (sockfd < 0) {
         fprintf(stderr, "Couldn't listen to port %d\n", port);
-        return NULL;
+        return 1;
     }
 
     listen(sockfd, 1);
@@ -445,26 +438,26 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
     close(sockfd);
     if (connfd < 0) {
         fprintf(stderr, "accept() failed\n");
-        return NULL;
+        return 1;
     }
 
     if (!bw_read_full(connfd, msg, sizeof msg)) {
         perror("server read");
         fprintf(stderr, "Couldn't read remote address\n");
-        goto out;
+        close(connfd);
+        return 1;
     }
 
-    rem_dest = bw_parse_dest(msg, 0);
-    if (!rem_dest) {
+    if (bw_parse_dest(msg, 0, &rem_dest)) {
         fprintf(stderr, "Couldn't parse remote address\n");
-        goto out;
+        close(connfd);
+        return 1;
     }
 
-    if (bw_connect_qp(ctx, ib_port, my_dest->psn, rem_dest)) {
+    if (bw_connect_qp(ctx, ib_port, my_dest->psn, &rem_dest)) {
         fprintf(stderr, "Couldn't connect to remote QP\n");
-        free(rem_dest);
-        rem_dest = NULL;
-        goto out;
+        close(connfd);
+        return 1;
     }
 
     /* Send our address plus the buffer addr/rkey the client needs for its
@@ -475,9 +468,8 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
             my_dest->buf_addr, my_dest->rkey);
     if (!bw_write_full(connfd, msg, sizeof msg)) {
         fprintf(stderr, "Couldn't send local address\n");
-        free(rem_dest);
-        rem_dest = NULL;
-        goto out;
+        close(connfd);
+        return 1;
     }
 
     /* Final beat: the client signals it has our address with "ready" and
@@ -488,15 +480,13 @@ static struct bw_dest *bw_exch_dest_server(struct bw_context *ctx,
 
         if (!bw_read_full(connfd, ready, sizeof ready)) {
             perror("server read");
-            free(rem_dest);
-            rem_dest = NULL;
-            goto out;
+            close(connfd);
+            return 1;
         }
     }
 
-out:
     close(connfd);
-    return rem_dest;
+    return 0;
 }
 
 static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
@@ -671,9 +661,7 @@ static int bw_post_control_recvs(struct bw_context *ctx)
 }
 
 /* Post one control SEND — the client's done or the server's ack — always
- * signaled so the sender consumes a completion. The message rides inline when
- * the QP's max_inline_data allows it (it always does in practice); the
- * fallback stages it in the registered control area. */
+ * signaled and riding inline. */
 static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
                              const struct bw_ctrl_msg *msg)
 {
@@ -685,22 +673,12 @@ static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid,
     struct ibv_send_wr wr = {
             .wr_id	    = wrid,
             .opcode	    = IBV_WR_SEND,
-            .send_flags = IBV_SEND_SIGNALED,
+            .send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE,
             .sg_list    = &sge,
             .num_sge    = 1,
             .next	    = NULL
     };
     struct ibv_send_wr *bad_wr;
-
-    if (ctx->max_inline_data >= (uint32_t) sizeof *msg) {
-        wr.send_flags |= IBV_SEND_INLINE;
-    } else {
-        /* Non-inline: the SEND is DMA-read from a registered buffer, so
-         * the message is staged in the control area. */
-        memcpy(ctx->ctrl_buf, msg, sizeof *msg);
-        sge.addr = (uint64_t) ctx->ctrl_buf;
-        sge.lkey = ctx->ctrl_mr->lkey;
-    }
 
     if (ibv_post_send(ctx->qp, &wr, &bad_wr)) {
         fprintf(stderr, "Couldn't post control SEND\n");
@@ -794,29 +772,14 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
  * the final list's remainder is covered by the CQEs the ack wait
  * consumes, never by the refill. Scoped to one size: the ack wait
  * consumes the remaining data and done completions without touching the
- * state, so it must not survive into the next size. */
-struct bw_data_state {
-    uint64_t posted;
-    uint64_t outstanding;
-};
-
 /* Refill-never-empty (ADR-0002): once the SQ is as deep as it can be,
  * reclaim only the CQEs that are ready — each data CQE accounts for
  * exactly K WRs, because only the K-th WR of the stream is signaled and
  * RC completions are in-order — then return immediately so the caller
- * reposts; the SQ never empties and the NIC never idles. The single
- * trigger is the SQ depth itself: with the SQ sized W + K (bw_init_ctx),
- * waiting while outstanding + K ≥ sq_depth holds the pipe at W
- * outstanding, and at sq_depth - K if the max_qp_wr clamp granted less.
- * The final list's CQE is never reclaimed here: no list is posted after
- * it, so the refill cannot run again; that CQE stays in the CQ for the
- * ack wait to consume (it precedes the ack, ADR-0003). During the data
- * path only data WRITE completions may be pending here, so anything else
- * is a protocol error; a poll returning 0 only means the last WQEs are
- * still in flight, so the poll is retried. */
-static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
+ * reposts; the SQ never empties and the NIC never idles. */
+static int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
 {
-    while (st->outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
+    while (*outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
@@ -829,7 +792,7 @@ static int bw_refill(struct bw_context *ctx, struct bw_data_state *st)
 
         if (bw_wc_bad(&wc))
             return 1;
-        st->outstanding -= SIGNAL_INTERVAL;
+        *outstanding -= SIGNAL_INTERVAL;
     }
     return 0;
 }
@@ -867,20 +830,19 @@ static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
 /* Post `n` RDMA WRITEs into the server's registered buffer using the pre-built
  * K-WR linked list `wrs`. */
 static int bw_post_writes(struct bw_context *ctx, uint64_t n,
-                          struct ibv_send_wr *wrs, struct bw_data_state *st)
+                          struct ibv_send_wr *wrs, uint64_t *outstanding)
 {
     while (n > 0) {
         struct ibv_send_wr *bad_wr;
 
-        if (bw_refill(ctx, st))
+        if (bw_refill(ctx, outstanding))
             return 1;
 
         if (ibv_post_send(ctx->qp, wrs, &bad_wr)) {
             fprintf(stderr, "Couldn't post data WRITEs\n");
             return 1;
         }
-        st->posted += SIGNAL_INTERVAL;
-        st->outstanding += SIGNAL_INTERVAL;
+        *outstanding += SIGNAL_INTERVAL;
         n -= SIGNAL_INTERVAL;
     }
     return 0;
@@ -902,19 +864,18 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
         printf("%zu\t%.2f\t%s\n", size, bps / 1000000000.0, "Gbps");
 }
 
-/* One post -> done -> ack round trip of `count` WRITEs of `size` bytes, on
- * a freshly-reset pipeline (bw_data_state does not survive a round). */
+/* One post -> done -> ack round trip of `count` WRITEs of `size` bytes. */
 static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
                         struct ibv_send_wr *wrs,
                         struct timespec *t0, struct timespec *t1)
 {
     struct bw_ctrl_msg done = { .seq = seq };
-    struct bw_data_state st = { 0, 0 };
+    uint64_t outstanding = 0;
 
     if (t0)
         clock_gettime(CLOCK_MONOTONIC, t0);
 
-    if (bw_post_writes(ctx, count, wrs, &st))
+    if (bw_post_writes(ctx, count, wrs, &outstanding))
         return 1;
 
     if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID, &done))
@@ -1049,7 +1010,7 @@ int main(int argc, char *argv[])
     struct ibv_device       *ib_dev;
     struct bw_context       *ctx;
     struct bw_dest          my_dest;
-    struct bw_dest         *rem_dest;
+    struct bw_dest          rem_dest;
     char                    *servername = NULL;
 
     srand48(getpid() * time(NULL));
@@ -1105,28 +1066,25 @@ int main(int argc, char *argv[])
 
     /* The path MTU comes from the port's active MTU, so large messages use
      * the largest packets the link allows. */
-    if (servername)
-        rem_dest = bw_exch_dest_client(servername, HANDSHAKE_PORT, &my_dest);
-    else {
+    if (servername) {
+        if (bw_exch_dest_client(servername, HANDSHAKE_PORT, &my_dest, &rem_dest))
+            return 1;
+        if (bw_connect_qp(ctx, IB_PORT, my_dest.psn, &rem_dest))
+            return 1;
+    } else {
         /* The server advertises its buffer — the client's RDMA WRITEs land
          * here — and nothing else beyond the template's QP address. */
         my_dest.buf_addr = (uint64_t) ctx->buf;
         my_dest.rkey = ctx->mr->rkey;
-        rem_dest = bw_exch_dest_server(ctx, IB_PORT, HANDSHAKE_PORT, &my_dest);
-    }
-
-    if (!rem_dest)
-        return 1;
-
-    if (servername)
-        if (bw_connect_qp(ctx, IB_PORT, my_dest.psn, rem_dest))
+        if (bw_exch_dest_server(ctx, IB_PORT, HANDSHAKE_PORT, &my_dest))
             return 1;
+    }
 
     /* The full sweep: the client streams the WRITEs of each size and
      * drives one done SEND per size, the server acks each. Both sides
      * verify every sequence counter. */
     if (servername) {
-        if (bw_client_bench(ctx, rem_dest))
+        if (bw_client_bench(ctx, &rem_dest))
             return 1;
     } else {
         if (bw_server_ctrl_exchange(ctx))
@@ -1137,7 +1095,6 @@ int main(int argc, char *argv[])
     {
         int rc = bw_close_ctx(ctx);
 
-        free(rem_dest);
         ibv_free_device_list(dev_list);
         return rc;
     }
