@@ -59,6 +59,7 @@
 #include <time.h>
 #include <inttypes.h>
 #include <sys/mman.h>
+#include <sched.h>
 
 #include <infiniband/verbs.h>
 
@@ -979,6 +980,79 @@ static int bw_close_ctx(struct bw_context *ctx)
     return 0;
 }
 
+/* Parse a sysfs cpulist (e.g. "0-7,16-23") into a cpu_set_t. */
+static void bw_parse_cpulist(const char *str, cpu_set_t *set)
+{
+    const char *p = str;
+
+    CPU_ZERO(set);
+    while (*p) {
+        char *end;
+        long a, b, c;
+
+        while (*p == ' ' || *p == ',' || *p == '\n')
+            p++;
+        if (!*p)
+            break;
+
+        a = strtol(p, &end, 10);
+        if (end == p)
+            break;
+        b = a;
+        p = end;
+        if (*p == '-') {
+            p++;
+            b = strtol(p, &end, 10);
+            p = end;
+        }
+        for (c = a; c <= b; ++c) {
+            if (c >= 0 && c < CPU_SETSIZE)
+                CPU_SET(c, set);
+        }
+    }
+}
+
+/* Query sysfs for the HCA's local NUMA node/CPUs and bind this thread
+ * to eliminate PCIe root-complex cross-socket latency (QPI/UPI traversal). */
+static void bw_pin_to_hca_numa(const char *dev_name)
+{
+    char path[128];
+    char buf[256];
+    FILE *f;
+    cpu_set_t set;
+
+    snprintf(path, sizeof(path),
+             "/sys/class/infiniband/%s/device/local_cpulist", dev_name);
+    f = fopen(path, "r");
+    if (!f) {
+        int numa = -1;
+        snprintf(path, sizeof(path),
+                 "/sys/class/infiniband/%s/device/numa_node", dev_name);
+        f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%d", &numa) == 1 && numa >= 0) {
+                fclose(f);
+                snprintf(path, sizeof(path),
+                         "/sys/devices/system/node/node%d/cpulist", numa);
+                f = fopen(path, "r");
+            } else {
+                fclose(f);
+                f = NULL;
+            }
+        }
+    }
+
+    if (!f)
+        return;
+
+    if (fgets(buf, sizeof(buf), f)) {
+        bw_parse_cpulist(buf, &set);
+        if (CPU_COUNT(&set) > 0)
+            (void) sched_setaffinity(0, sizeof(set), &set);
+    }
+    fclose(f);
+}
+
 int main(int argc, char *argv[])
 {
     struct ibv_device      **dev_list;
@@ -1011,6 +1085,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "No IB devices found\n");
         return 1;
     }
+
+    bw_pin_to_hca_numa(ibv_get_device_name(ib_dev));
 
     ctx = bw_init_ctx(ib_dev, IB_PORT, !servername);
     if (!ctx)
