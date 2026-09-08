@@ -706,6 +706,7 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
                          struct ibv_wc *wc)
 {
     struct timespec deadline;
+    uint64_t spins = 0;
 
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += CTRL_POLL_TIMEOUT_SEC;
@@ -726,14 +727,16 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
             continue;
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec &&
-             now.tv_nsec >= deadline.tv_nsec)) {
-            fprintf(stderr,
-                    "Timed out after %d s waiting for wr_id %llu\n",
-                    CTRL_POLL_TIMEOUT_SEC, (unsigned long long) want);
-            return 1;
+        if ((++spins & 0xfff) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > deadline.tv_sec ||
+                (now.tv_sec == deadline.tv_sec &&
+                 now.tv_nsec >= deadline.tv_nsec)) {
+                fprintf(stderr,
+                        "Timed out after %d s waiting for wr_id %llu\n",
+                        CTRL_POLL_TIMEOUT_SEC, (unsigned long long) want);
+                return 1;
+            }
         }
     }
 }
