@@ -690,9 +690,9 @@ static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid)
 
 /* Classify one completion: checks for good status.
  * Prints the error and returns 1 otherwise. */
-static int bw_wc_bad(struct ibv_wc *wc)
+static inline __attribute__((always_inline)) int bw_wc_bad(struct ibv_wc *wc)
 {
-    if (wc->status != IBV_WC_SUCCESS) {
+    if (__builtin_expect(wc->status != IBV_WC_SUCCESS, 0)) {
         fprintf(stderr, "Bad status %s (%d) for wr_id %llu\n",
                 ibv_wc_status_str(wc->status), wc->status,
                 (unsigned long long) wc->wr_id);
@@ -716,12 +716,12 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
         struct timespec now;
         int ne = ibv_poll_cq(ctx->cq, 1, wc);
 
-        if (ne < 0) {
+        if (__builtin_expect(ne < 0, 0)) {
             fprintf(stderr, "poll CQ failed %d\n", ne);
             return 1;
         }
         if (ne == 1) {
-            if (bw_wc_bad(wc))
+            if (__builtin_expect(bw_wc_bad(wc), 0))
                 return 1;
             if (wc->wr_id == want)
                 return 0;
@@ -766,13 +766,13 @@ static int bw_recv_ctrl(struct bw_context *ctx, struct timespec *t_stamp)
  * exactly K WRs, because only the K-th WR of the stream is signaled and
  * RC completions are in-order — then return immediately so the caller
  * reposts; the SQ never empties and the NIC never idles. */
-static int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
+static inline __attribute__((always_inline)) int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
 {
     while (*outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
         struct ibv_wc wc;
         int ne = ibv_poll_cq(ctx->cq, 1, &wc);
 
-        if (ne < 0) {
+        if (__builtin_expect(ne < 0, 0)) {
             fprintf(stderr, "poll CQ failed %d\n", ne);
             return 1;
         }
@@ -783,7 +783,7 @@ static int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
             continue;
         }
 
-        if (bw_wc_bad(&wc))
+        if (__builtin_expect(bw_wc_bad(&wc), 0))
             return 1;
         *outstanding -= SIGNAL_INTERVAL;
     }
@@ -821,16 +821,16 @@ static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
 
 /* Post `n` RDMA WRITEs into the server's registered buffer using the pre-built
  * K-WR linked list `wrs`. */
-static int bw_post_writes(struct bw_context *ctx, uint64_t n,
-                          struct ibv_send_wr *wrs, uint64_t *outstanding)
+static inline __attribute__((always_inline)) int bw_post_writes(struct bw_context *ctx, uint64_t n,
+                                                                 struct ibv_send_wr *wrs, uint64_t *outstanding)
 {
     while (n > 0) {
         struct ibv_send_wr *bad_wr;
 
-        if (bw_refill(ctx, outstanding))
+        if (__builtin_expect(bw_refill(ctx, outstanding), 0))
             return 1;
 
-        if (ibv_post_send(ctx->qp, wrs, &bad_wr)) {
+        if (__builtin_expect(ibv_post_send(ctx->qp, wrs, &bad_wr), 0)) {
             fprintf(stderr, "Couldn't post data WRITEs\n");
             return 1;
         }
@@ -857,16 +857,16 @@ static void bw_print_result(size_t size, uint64_t count, double elapsed)
 }
 
 /* One post -> done -> ack round trip of `count` WRITEs. */
-static int bw_run_round(struct bw_context *ctx, uint64_t count,
-                        struct ibv_send_wr *wrs,
-                        struct timespec *t0, struct timespec *t1)
+static inline __attribute__((always_inline)) int bw_run_round(struct bw_context *ctx, uint64_t count,
+                                                               struct ibv_send_wr *wrs,
+                                                               struct timespec *t0, struct timespec *t1)
 {
     uint64_t outstanding = 0;
 
     if (t0)
         clock_gettime(CLOCK_MONOTONIC, t0);
 
-    if (bw_post_writes(ctx, count, wrs, &outstanding))
+    if (__builtin_expect(bw_post_writes(ctx, count, wrs, &outstanding), 0))
         return 1;
 
     if (bw_post_ctrl_send(ctx, BW_SEND_DONE_WRID))
