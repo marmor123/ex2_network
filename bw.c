@@ -114,17 +114,15 @@ static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
         0                          /* 1MB */
 };
 
-/* Control messages: 8 bytes each — a fixed tag plus the sequence counter
- * (the size index 0..20). The ack carries the received done verbatim, so
- * a tag or sequence mismatch means the exchange desynchronized. */
-#define BW_CTRL_TAG 0x4354524cu
+/* Control messages: 4 bytes carrying the sequence counter (the size
+ * index 0..20). The ack carries the received done verbatim, so a
+ * sequence mismatch means the exchange desynchronized. */
 struct bw_ctrl_msg {
-    uint32_t tag;
     uint32_t seq;
 };
 
 /* The control message must always fit one inline send. */
-typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 8) ? 1 : -1];
+typedef char bw_ctrl_msg_size[(sizeof (struct bw_ctrl_msg) == 4) ? 1 : -1];
 
 /* A control wait (the done on the server, the ack on the client, the
  * ack-send on the server) has a deadline: the peer may have died, and a
@@ -763,7 +761,7 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
 }
 
 /* Wait for the next control message on the pre-posted control receive
- * pool and verify it: the fixed tag and the expected sequence counter.
+ * pool and verify it: the expected sequence counter.
  * `t_stamp`, when non-NULL, receives CLOCK_MONOTONIC at the completion —
  * the client's t1 for this size. */
 static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
@@ -779,9 +777,9 @@ static int bw_recv_ctrl(struct bw_context *ctx, uint32_t seq,
         clock_gettime(CLOCK_MONOTONIC, t_stamp);
 
     msg = *(const struct bw_ctrl_msg *) ctx->ctrl_buf;
-    if (msg.tag != BW_CTRL_TAG || msg.seq != seq) {
-        fprintf(stderr, "%s mismatch: tag 0x%x seq %u, expected seq %u\n",
-                kind, msg.tag, msg.seq, seq);
+    if (msg.seq != seq) {
+        fprintf(stderr, "%s mismatch: seq %u, expected seq %u\n",
+                kind, msg.seq, seq);
         return 1;
     }
 
@@ -910,7 +908,7 @@ static int bw_run_round(struct bw_context *ctx, uint32_t seq, uint64_t count,
                         struct ibv_send_wr *wrs,
                         struct timespec *t0, struct timespec *t1)
 {
-    struct bw_ctrl_msg done = { .tag = BW_CTRL_TAG, .seq = seq };
+    struct bw_ctrl_msg done = { .seq = seq };
     struct bw_data_state st = { 0, 0 };
 
     if (t0)
@@ -989,7 +987,7 @@ static int bw_server_ctrl_exchange(struct bw_context *ctx)
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         for (round = 0; round < 2; ++round) {
-            struct bw_ctrl_msg ack = { .tag = BW_CTRL_TAG, .seq = seq };
+            struct bw_ctrl_msg ack = { .seq = seq };
             struct ibv_wc wc;
 
             if (bw_recv_ctrl(ctx, seq, "Done", NULL))
