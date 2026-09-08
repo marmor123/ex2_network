@@ -2,41 +2,39 @@
  * Lab #2 — Verbs throughput benchmark (single source, server and client
  * roles decided by argv: no hostname argument = server, hostname = client).
  *
- * Stage 5 (T5): the streaming data path (ADR-0002) replacing the naive
- * one. The client runs the 21-size sweep (1 B..1 MB, powers of two) with
- * a per-size counts table re-converged on this RDMA path with warmup in
- * place (MSG_COUNTS; ex1's original TCP-path table is gone). Per size, a
- * per-size warmup round (WARMUP_COUNTS, mostly 0 — chosen from
- * measurement, not applied uniformly, see
- * docs/research/perf-experiments.md) runs untimed before the timed
- * benchmark round whose batch of RDMA WRITEs is clocked: K WRs posted
- * per ibv_post_send as a linked list (W=128, K=32, re-measured on this
- * RDMA path — see docs/research/perf-experiments.md), only the K-th WR
- * of the stream signaled — one CQE per K WRs, so completions are
- * accounted in exact multiples of K (RC in-order)
- * — reclaimed only while the window is full (refill-never-empty, the SQ
- * never empties), and messages ≤ max_inline_data sent with IBV_SEND_INLINE.
- * The clock (CLOCK_MONOTONIC) starts at the benchmark round's first post
- * and stops at its ack-receive completion (ADR-0003); each size prints an
- * ex1-identical "size\t%.2f\tunit" line with auto-scaled bps→Gbps units
- * for that round only — the warmup round is silent. The server's only
- * data-path role is absorbing the WRITEs into its registered buffer; it
- * just acks each done, two rounds per size to mirror the client.
+ * Architecture & Data Path:
+ * Measures unidirectional (client -> server) throughput across a 21-size sweep
+ * (1 B..1 MB, powers of two) over an RC QP using RDMA WRITEs.
  *
- * The control protocol (T3): per size one done SEND (client, signaled)
- * and one ack SEND (server, 8-byte inline carrying the sequence counter),
- * both riding the data QP (ADR-0001) over the 32-deep control receive
- * pool posted at init, never refreshed.
+ * - Sweep Structure: Per size, an untimed warmup round (WARMUP_COUNTS) pipelines
+ *   writes into the HCA, immediately followed by the timed benchmark round
+ *   (MSG_COUNTS). Only the timed round is clocked (CLOCK_MONOTONIC), starting at
+ *   its first post and stopping at the ack-receive completion. Each size emits
+ *   an ex1-identical "size\t%.2f\tunit" line with auto-scaled units (bps..Gbps).
  *
- * Device init and handshake: the two 1 MB buffer registrations (the
- * server's with remote-write permission); QP create → init → RTR → RTS
- * with the port's active MTU; the TCP exchange of LID/QPN/PSN plus the
- * server's buffer addr/rkey.
+ * - Streaming Pipeline: K WRs (SIGNAL_INTERVAL=32) are posted per ibv_post_send
+ *   as a linked list within a window of W=128 outstanding WRs. Only the K-th WR
+ *   is signaled (one CQE per K WRs, exact accounting via RC in-order delivery).
+ *   The send-loop follows a refill-never-empty discipline, reclaiming ready CQEs
+ *   only when the window is full so the SQ never starves and the HCA never idles.
  *
- * Adapted from the assignment's bw_template.c: the socket exchange is the
- * template's, extended with the server's buffer address and rkey; the QP
- * lifecycle (INIT/RTR/RTS, rnr_retry/retry_cnt, access flags) is the
- * template's.
+ * - Payload Inlining: Messages <= 64 B (and <= max_inline_data) are posted with
+ *   IBV_SEND_INLINE to eliminate DMA overhead; larger messages take the DMA path
+ *   to avoid userspace payload copy bottlenecks.
+ *
+ * - Control Protocol: Each round (warmup and benchmark) synchronizes via a 1-byte
+ *   inline SEND/RECV exchange riding the data QP: the client posts a done SEND,
+ *   and the server replies with an ack SEND. By RC ordering, the done SEND acts
+ *   as a completion barrier proving all prior WRITEs landed in server memory.
+ *   Both roles post a 42-deep control receive pool at initialization (never refreshed).
+ *
+ * - System Optimizations: Work buffers are 2 MB aligned with transparent hugepage
+ *   advice (MADV_HUGEPAGE) to minimize HCA MTT entries. The process binds to the
+ *   HCA's local NUMA socket to eliminate cross-socket QPI/UPI latency. Spin loops
+ *   incorporate CPU pause instructions and throttled deadline checks.
+ *
+ * Adapted from the assignment's bw_template.c: TCP handshake exchanges QP address
+ * info plus the server's registered buffer address and rkey.
  */
 
 /* asprintf and the srand48/lrand48 family are GNU/SVID extensions: newer
@@ -81,17 +79,10 @@
 #define CTRL_POOL_DEPTH (2 * SWEEP_SIZES)
 #define CTRL_MSG_LEN 64
 
-/* Per-size benchmark count, re-converged on this RDMA path with the
- * per-size warmup round now in place (ex1's original table above was
- * TCP-path convergence, carried forward unchanged until this point).
- * Chosen as the smallest multiplier of the original ex1 table whose
- * measured Gbps is within 1% of the largest-count (2x) reading — the
- * most-diluted, most-accurate reading available — rather than whichever
- * multiplier reports the highest number: a short run reads *higher* than
- * the true rate (fixed per-round overhead and warmup carryover are a
- * bigger share of a short timed window), so picking the top number would
- * mean reporting that bias, not a real speedup. Full sweep table and
- * rationale: docs/research/perf-experiments.md. */
+/* Per-size benchmark message counts for the timed round.
+ * Counts are tuned on this RDMA path so each size measures a converged
+ * throughput reading (variance < 1% compared to doubled counts), with larger
+ * counts at higher message sizes to dilute fixed per-round overhead. */
 static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         163840, 10240, 81920, 20480, 40960,     /* 1B 2B 4B 8B 16B */
         10240, 10240, 10240, 5120, 2560,        /* 32B 64B 128B 256B 512B */
@@ -100,14 +91,10 @@ static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         256                                     /* 1MB */
 };
 
-/* Per-size warmup count: an untimed round of this many WRITEs immediately
- * before the timed benchmark round (bw_client_bench), on by the
- * assignment's requirement. Chosen per size from a 5-level sweep (0, K,
- * W, 2W, QP_SLACK; 10 runs each) as the smallest nonzero level scoring
- * within noise of that size's best — sizes where 0 already scored best
- * (15 of 21) get 0: warmup genuinely does not help there, and forcing a
- * nonzero count would not be an honest use of the data. Full sweep table
- * and rationale: docs/research/perf-experiments.md. */
+/* Per-size warmup message counts: an untimed batch sent immediately before
+ * the timed benchmark round to pipeline writes into the HCA. Empirically tuned
+ * per size; sizes where warmup does not measurably reduce variance or improve
+ * throughput are set to 0. */
 static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
         64, 0, 0, 0, 0,           /* 1B 2B 4B 8B 16B */
         0, 64, 64, 0, 0,          /* 32B 64B 128B 256B 512B */
@@ -127,22 +114,19 @@ static const uint64_t WARMUP_COUNTS[SWEEP_SIZES] = {
 #define IB_PORT 1
 #define HANDSHAKE_PORT 18515
 
-/* Pipe depth W (window) and signal interval K, re-measured on this RDMA
- * path (ADR-0006 measured the old 256/64 invariant, but that predates
- * this session's re-test, which found W=128/K=32 a small, reproducible
- * edge over 256/64 — confound-controlled against a run-order/drift
- * effect by re-running with the level order reversed; the win held
- * either way. Full sweep and rationale: docs/research/perf-experiments.md.
- * The SQ depth is requested as W + K: the pipe depth plus one signal
- * interval, exactly the deepest the refill lets the SQ get: its single
- * trigger (outstanding + K ≥ sq_depth) holds the pipe at W outstanding
- * when the grant matches the request, and at sq_depth - K if the
- * max_qp_wr clamp cuts the grant short. */
+/* Pipe depth W (window) and signal interval K:
+ * W=128 outstanding WRs keeps the HCA pipeline saturated without bloating
+ * completion queues. Signaling only every K-th WR (K=32) cuts CQ polling
+ * overhead while RC in-order completions ensure exact accounting.
+ *
+ * Sizing: The SQ depth is requested as W + K. Refill triggers whenever
+ * (outstanding + K >= sq_depth), holding the pipeline at W outstanding WRs
+ * and ensuring space is always reserved for the done SEND. */
 #define WINDOW 128
 #define SIGNAL_INTERVAL 32
 
-/* K ≤ W keeps the pipe (W outstanding) at least one full K-WR list deep,
- * so the refill never fires before a complete list is in flight. */
+/* K <= W guarantees the pipeline holds at least one full K-WR list before
+ * refill can trigger. */
 typedef char bw_params_sane[SIGNAL_INTERVAL <= WINDOW ? 1 : -1];
 
 /* The largest max_inline_data tried at QP creation. mlx4 — the course
@@ -165,18 +149,17 @@ typedef char bw_params_sane[SIGNAL_INTERVAL <= WINDOW ? 1 : -1];
 #define DEST_FMT_PARSE   "%x:%x:%x:%" SCNx64 ":%x"
 
 enum {
-    /* Control receive: the done on the server, the ack on the client. All
-     * 32 receives of the control receive pool share one wr_id — they all
-     * point at the same control area, so which receive completed never
-     * matters. */
+    /* Control receive: absorbs done SEND on the server, ack SEND on the client.
+     * All 42 receives of the control pool (CTRL_POOL_DEPTH) share one wr_id
+     * since they all target the pre-allocated control buffer. */
     BW_RECV_WRID = 1,
     /* The client's done SEND, always signaled. */
     BW_SEND_DONE_WRID,
     /* The server's ack SEND, always signaled so the server consumes its
      * completion before exiting. */
     BW_SEND_ACK_WRID,
-    /* Data WRITEs; one shared wr_id keeps their completions
-     * distinguishable from the control messages. */
+    /* Data WRITEs; shared wr_id keeps data completions distinguishable
+     * from control message completions. */
     BW_DATA_WRID,
 };
  
@@ -635,9 +618,9 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
     return ctx;
 }
 
-/* Post the entire control receive pool — never refreshed: each control
- * message consumes one pre-posted receive, and 32 cover a full sweep
- * (ADR-0001, assignment item 3). Returns 0 when all are posted. */
+/* Post the entire control receive pool at init (never refreshed).
+ * Exactly 2 * SWEEP_SIZES (42) receives are pre-posted to absorb the warmup
+ * and benchmark control messages for all 21 sizes (assignment item 3). */
 static int bw_post_control_recvs(struct bw_context *ctx)
 {
     struct ibv_sge list = {
@@ -661,8 +644,9 @@ static int bw_post_control_recvs(struct bw_context *ctx)
     return i == CTRL_POOL_DEPTH ? 0 : 1;
 }
 
-/* Post one control SEND — the client's done or the server's ack — always
- * signaled and riding inline. */
+/* Post one control SEND — client's done or server's ack.
+ * Always signaled and sent inline with a 1-byte dummy payload to act
+ * as a completion barrier without data transfer overhead. */
 static int bw_post_ctrl_send(struct bw_context *ctx, uint64_t wrid)
 {
     char dummy = 0;
@@ -702,7 +686,9 @@ static inline __attribute__((always_inline)) int bw_wc_bad(struct ibv_wc *wc)
 }
 
 /* Poll the shared CQ until a completion with wr_id `want` arrives.
- * A bad status or a wait past the deadline is an error. */
+ * A bad status or a wait past the deadline is an error.
+ * The timeout clock read is throttled to every 4096 empty spins to avoid
+ * system call overhead; spin loops execute a CPU pause instruction. */
 static int bw_poll_until(struct bw_context *ctx, uint64_t want,
                          struct ibv_wc *wc)
 {
@@ -761,11 +747,11 @@ static int bw_recv_ctrl(struct bw_context *ctx, struct timespec *t_stamp)
     return 0;
 }
 
-/* Refill-never-empty (ADR-0002): once the SQ is as deep as it can be,
- * reclaim only the CQEs that are ready — each data CQE accounts for
- * exactly K WRs, because only the K-th WR of the stream is signaled and
- * RC completions are in-order — then return immediately so the caller
- * reposts; the SQ never empties and the NIC never idles. */
+/* Refill-never-empty: once the SQ has reached maximum allowable occupancy
+ * (sq_depth - SIGNAL_INTERVAL), poll for ready CQEs before posting more.
+ * Each data CQE accounts for exactly SIGNAL_INTERVAL WRs because only the K-th
+ * WR is signaled and RC deliveries are strictly in-order. Reclaiming only ready
+ * completions keeps the pipeline full without stalling on empty polls. */
 static inline __attribute__((always_inline)) int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
 {
     while (*outstanding + SIGNAL_INTERVAL >= (uint64_t) ctx->sq_depth) {
@@ -790,6 +776,10 @@ static inline __attribute__((always_inline)) int bw_refill(struct bw_context *ct
     return 0;
 }
 
+/* Build a linked list of SIGNAL_INTERVAL (32) RDMA WRITE work requests.
+ * Only the final WR in the chain is signaled (IBV_SEND_SIGNALED).
+ * Inlining (IBV_SEND_INLINE) is enabled only for payloads <= 64 B (and <= max_inline_data),
+ * where copying data into the WQE avoids DMA overhead without CPU copy bottlenecks. */
 static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
                              size_t size, struct bw_wr_node *nodes)
 {
@@ -952,6 +942,7 @@ static int bw_server_ctrl_exchange(struct bw_context *ctx)
     return 0;
 }
 
+/* Clean up and release all allocated Verbs and host resources. */
 static int bw_close_ctx(struct bw_context *ctx)
 {
     if (ibv_destroy_qp(ctx->qp)) {
@@ -1090,7 +1081,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* The first device found — the option-era -d selection is gone. */
+    /* Select the first available InfiniBand device. */
     ib_dev = *dev_list;
     if (!ib_dev) {
         fprintf(stderr, "No IB devices found\n");
@@ -1140,9 +1131,8 @@ int main(int argc, char *argv[])
             return 1;
     }
 
-    /* The full sweep: the client streams the WRITEs of each size and
-     * drives one done SEND per size, the server acks each. Both sides
-     * verify every sequence counter. */
+    /* Run the 21-size benchmark sweep: the client streams WRITEs and drives
+     * done SENDs per round; the server absorbs data and replies with acks. */
     if (servername) {
         if (bw_client_bench(ctx, &rem_dest))
             return 1;
