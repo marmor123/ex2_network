@@ -58,12 +58,13 @@
 #include <netdb.h>
 #include <time.h>
 #include <inttypes.h>
+#include <sys/mman.h>
 
 #include <infiniband/verbs.h>
 
-/* One 1 MB buffer per side, registered once and never modified after init,
- * so there is no buffer-reuse hazard at full window depth (ADR-0002). */
-#define BUFFER_SIZE (1u << 20)
+/* One 2 MB buffer per side, 2 MB aligned to enable transparent hugepage
+ * collapsing into a single HCA MTT entry (ADR-0002). */
+#define BUFFER_SIZE (2u << 20)
 
 /* The number of control exchanges per direction: one done/ack pair per
  * size of the sweep (2^0..2^20). */
@@ -177,17 +178,15 @@ enum {
      * distinguishable from the control messages. */
     BW_DATA_WRID,
 };
-
-static int page_size;
-
+ 
 struct bw_context {
     struct ibv_context		*context;
     struct ibv_pd		*pd;
-    struct ibv_mr		*mr;      /* the 1 MB buffer */
+    struct ibv_mr		*mr;      /* the 2 MB buffer */
     struct ibv_mr		*ctrl_mr; /* the control receive area */
     struct ibv_cq		*cq;
     struct ibv_qp		*qp;
-    void			*buf;     /* the 1 MB buffer */
+    void			*buf;     /* the 2 MB buffer */
     void			*ctrl_buf;/* the control receive area */
     uint32_t		 max_inline_data; /* the QP's negotiated max_inline_data */
     uint32_t		 sq_depth;      /* the QP's negotiated max_send_wr */
@@ -491,11 +490,14 @@ static struct bw_context *bw_init_ctx(struct ibv_device *ib_dev, int port,
     if (!ctx)
         return NULL;
 
-    ctx->buf = malloc(roundup(BUFFER_SIZE, page_size));
-    if (!ctx->buf) {
+    if (posix_memalign(&ctx->buf, BUFFER_SIZE, BUFFER_SIZE)) {
         fprintf(stderr, "Couldn't allocate work buf.\n");
         return NULL;
     }
+#ifdef MADV_HUGEPAGE
+    madvise(ctx->buf, BUFFER_SIZE, MADV_HUGEPAGE);
+#endif
+    memset(ctx->buf, 0, BUFFER_SIZE);
 
     ctx->ctrl_buf = malloc(CTRL_MSG_LEN);
     if (!ctx->ctrl_buf) {
@@ -996,8 +998,6 @@ int main(int argc, char *argv[])
     else if (argc > 2) {
         return 1;
     }
-
-    page_size = sysconf(_SC_PAGESIZE);
 
     dev_list = ibv_get_device_list(NULL);
     if (!dev_list) {
