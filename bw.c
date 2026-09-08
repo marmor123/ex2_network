@@ -94,8 +94,8 @@ static const uint64_t MSG_COUNTS[SWEEP_SIZES] = {
         163840, 10240, 81920, 20480, 40960,     /* 1B 2B 4B 8B 16B */
         10240, 10240, 10240, 5120, 2560,        /* 32B 64B 128B 256B 512B */
         5120, 10240, 2560, 640, 320,            /* 1KB 2KB 4KB 8KB 16KB */
-        320, 96, 64, 32, 32,                    /* 32KB 64KB 128KB 256KB 512KB */
-        32                                       /* 1MB */
+        320, 96, 64, 128, 256,                  /* 32KB 64KB 128KB 256KB 512KB */
+        256                                     /* 1MB */
 };
 
 /* Per-size warmup count: an untimed round of this many WRITEs immediately
