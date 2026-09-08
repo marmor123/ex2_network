@@ -731,6 +731,9 @@ static int bw_poll_until(struct bw_context *ctx, uint64_t want,
                 return 1;
             }
         }
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
     }
 }
 
@@ -765,8 +768,12 @@ static int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
             fprintf(stderr, "poll CQ failed %d\n", ne);
             return 1;
         }
-        if (ne == 0)
+        if (ne == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
             continue;
+        }
 
         if (bw_wc_bad(&wc))
             return 1;
