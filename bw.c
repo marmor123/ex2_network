@@ -204,6 +204,14 @@ struct bw_dest {
     uint32_t rkey;
 };
 
+/* Unified WR + SGE node aligned to 128 bytes (two 64-byte L1 cachelines).
+ * Co-locating the WR and SGE eliminates cacheline straddling and pointer chasing
+ * during ibv_post_send list traversal. */
+struct bw_wr_node {
+    struct ibv_send_wr wr;
+    struct ibv_sge sge;
+} __attribute__((aligned(128)));
+
 /* Loop until len bytes move or the stream ends: the handshake messages are
  * fixed-size, and a short read would break the parse. */
 static int bw_read_full(int fd, void *buf, size_t len)
@@ -783,8 +791,7 @@ static int bw_refill(struct bw_context *ctx, uint64_t *outstanding)
 }
 
 static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
-                             size_t size, struct ibv_send_wr *wrs,
-                             struct ibv_sge *sges)
+                             size_t size, struct bw_wr_node *nodes)
 {
     uint32_t inline_flag =
         (size <= 64 && size <= ctx->max_inline_data)
@@ -793,22 +800,22 @@ static void bw_build_wr_list(struct bw_context *ctx, const struct bw_dest *dest,
     uint64_t i;
 
     for (i = 0; i < SIGNAL_INTERVAL; ++i) {
-        sges[i] = (struct ibv_sge) {
+        nodes[i].sge = (struct ibv_sge) {
             .addr   = (uint64_t) ctx->buf,
             .length = size,
             .lkey   = ctx->mr->lkey
         };
-        wrs[i] = (struct ibv_send_wr) {
+        nodes[i].wr = (struct ibv_send_wr) {
             .wr_id      = BW_DATA_WRID,
             .opcode     = IBV_WR_RDMA_WRITE,
             .send_flags = inline_flag |
                           (i == SIGNAL_INTERVAL - 1 ? IBV_SEND_SIGNALED : 0),
-            .sg_list    = &sges[i],
+            .sg_list    = &nodes[i].sge,
             .num_sge    = 1,
-            .next       = (i + 1 < SIGNAL_INTERVAL) ? &wrs[i + 1] : NULL
+            .next       = (i + 1 < SIGNAL_INTERVAL) ? &nodes[i + 1].wr : NULL
         };
-        wrs[i].wr.rdma.remote_addr = dest->buf_addr;
-        wrs[i].wr.rdma.rkey = dest->rkey;
+        nodes[i].wr.wr.rdma.remote_addr = dest->buf_addr;
+        nodes[i].wr.wr.rdma.rkey = dest->rkey;
     }
 }
 
@@ -877,18 +884,16 @@ static int bw_run_round(struct bw_context *ctx, uint64_t count,
  * and stops at the ack-receive completion (ADR-0003). */
 static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 {
-    /* The K-deep WR arrays, reused for every linked list of the sweep. */
-    struct ibv_send_wr *wrs;
-    struct ibv_sge *sges;
+    /* The K-deep unified WR+SGE node array, 128-byte aligned. */
+    struct bw_wr_node *nodes = NULL;
     uint32_t seq;
     int rc = 1;
 
-    wrs = calloc(SIGNAL_INTERVAL, sizeof *wrs);
-    sges = calloc(SIGNAL_INTERVAL, sizeof *sges);
-    if (!wrs || !sges) {
+    if (posix_memalign((void **) &nodes, 128, SIGNAL_INTERVAL * sizeof *nodes)) {
         fprintf(stderr, "Couldn't allocate data batch\n");
         goto out;
     }
+    memset(nodes, 0, SIGNAL_INTERVAL * sizeof *nodes);
 
     for (seq = 0; seq < SWEEP_SIZES; ++seq) {
         size_t size = (size_t) 1 << seq;
@@ -896,13 +901,13 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
         struct timespec t0, t1;
         double elapsed;
 
-        bw_build_wr_list(ctx, dest, size, wrs, sges);
+        bw_build_wr_list(ctx, dest, size, nodes);
 
         if (bw_run_round(ctx, WARMUP_COUNTS[seq],
-                         wrs, NULL, NULL))
+                         &nodes[0].wr, NULL, NULL))
             goto out;
 
-        if (bw_run_round(ctx, count, wrs, &t0, &t1))
+        if (bw_run_round(ctx, count, &nodes[0].wr, &t0, &t1))
             goto out;
 
         elapsed = (double) (t1.tv_sec - t0.tv_sec) +
@@ -912,8 +917,7 @@ static int bw_client_bench(struct bw_context *ctx, const struct bw_dest *dest)
 
     rc = 0;
 out:
-    free(sges);
-    free(wrs);
+    free(nodes);
     return rc;
 }
 
