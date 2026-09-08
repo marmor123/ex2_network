@@ -3,8 +3,8 @@
 # Runs the ex2 bw client 10x against a peer node and prints the per-size
 # average throughput across the successful runs.
 #
-# Requires: ~/.ssh/config with a "mlx-stud-02" host entry (ProxyJump via
-# bava.cs.huji.ac.il) -- already set up.
+# Requires: ~/.ssh/config with "mlx-stud-03" and "mlx-stud-04" host entries
+# (ProxyJump via bava.cs.huji.ac.il) -- already set up.
 #
 # IMPORTANT: this is a client/server benchmark (see assignment.md). A fresh
 # `./server` instance must be running on the peer node for EACH of the 10
@@ -12,15 +12,16 @@
 # the peer manually before each run, or in a loop in another session, e.g.:
 #   ssh <peer> 'cd ~/networking/ex2/ex2_network && for i in $(seq 1 10); do ./server; done'
 #
-# Usage: ./run_bw_avg.sh [peer_host] [n_runs]
+# Usage: ./run_bw_avg.sh [peer_host] [n_runs] [client_host]
 
 set -u
 
-PEER="${1:-mlx-stud-01}"
+PEER="${1:-mlx-stud-03}"
 N="${2:-10}"
+CLIENT="${3:-mlx-stud-04}"
 REMOTE_DIR="~/networking/ex2/ex2_network"
 
-ssh mlx-stud-02 "bash -s" -- "$PEER" "$N" "$REMOTE_DIR" <<'REMOTE'
+ssh "$CLIENT" "bash -s" -- "$PEER" "$N" "$REMOTE_DIR" <<'REMOTE'
 set -u
 peer="$1"
 n="$2"

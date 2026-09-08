@@ -16,7 +16,7 @@ prints the per-size average Gbps table. No dependency on anything
 removed from `bw.c`.
 
 ```
-./run_bw_avg.sh [peer_host] [n_runs]
+./run_bw_avg.sh [peer_host] [n_runs] [client_host]
 ```
 
 ## `sweep_warmup.sh`, `sweep_benchcount.sh`, `sweep_wk.sh`
